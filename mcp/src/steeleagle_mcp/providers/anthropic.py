@@ -47,6 +47,8 @@ class AnthropicProvider(LLMProvider):
     ) -> None:
         """Run one LLM turn: send messages, execute any tool calls."""
         logger.info("LLM request  model=%s messages=%d", model, len(messages))
+        # reasoning_effort is OpenAI-only. Anthropic Messages uses its own
+        # thinking/output_config.effort controls; do not forward that setting.
         response = client.messages.create(
             model=model,
             messages=messages,

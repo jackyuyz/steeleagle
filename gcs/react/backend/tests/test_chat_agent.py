@@ -1,6 +1,10 @@
-from unittest.mock import patch
+import json
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+import httpx
 import pytest
+from openai import OpenAI
 
 from app.chat_agent import (
     CHAT_RECOMMENDED_WORKFLOW,
@@ -13,6 +17,8 @@ from app.chat_agent import (
     sanitize_translate_payload,
 )
 from app.dsl_graph import init_dsl_parser, parse_dsl_to_graph
+from steeleagle_mcp.providers.anthropic import AnthropicProvider
+from steeleagle_mcp.providers.openai import OpenAIProvider
 
 
 MINIMAL_DSL = """\
@@ -79,6 +85,94 @@ def test_load_client_settings_reads_repo_config():
     settings = load_client_settings()
     assert settings["provider"] in {"openai", "anthropic"}
     assert settings["model"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "effort", "expected_effort"),
+    [("gpt-6-sol", "none", "none"), ("gpt-6-sol", None, "none"), ("gpt-4o", "none", None)],
+)
+async def test_openai_config_and_reasoning_reach_every_chat_tool_round(
+    tmp_path, model, effort, expected_effort
+):
+    config_path = tmp_path / "client.toml"
+    config_path.write_text(
+        f'[client]\nprovider = "openai"\nmodel = "{model}"\n'
+        'openai_api_key = "test-key"\n'
+        + ('reasoning_effort = "none"\n' if effort else "")
+    )
+    requests = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        message = {"role": "assistant", "content": f"Mission ready.\n```dsl\n{MINIMAL_DSL}```"}
+        if len(requests) == 1:
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call-compile",
+                    "type": "function",
+                    "function": {
+                        "name": "compile_mission_dsl",
+                        "arguments": json.dumps({"dsl": MINIMAL_DSL}),
+                    },
+                }],
+            }
+        return httpx.Response(200, json={
+            "id": "chat-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": body["model"],
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": "tool_calls" if len(requests) == 1 else "stop",
+            }],
+        })
+
+    with OpenAI(
+        api_key="test-key", http_client=httpx.Client(transport=httpx.MockTransport(handle))
+    ) as api:
+        with patch.object(OpenAIProvider, "create_client", return_value=api):
+            result = await run_chat_turn(
+                [{"role": "user", "content": "Take off to 10 meters, then land."}],
+                config_path=config_path,
+            )
+
+    assert len(requests) == 2
+    assert all(r["model"] == model for r in requests)
+    if expected_effort is None:
+        assert all("reasoning_effort" not in r for r in requests)
+    else:
+        assert all(r["reasoning_effort"] == expected_effort for r in requests)
+    tool_reply = requests[1]["messages"][-1]
+    assert tool_reply["role"] == "tool"
+    assert json.loads(tool_reply["content"])["ok"]
+    assert result["draft"]["normalized_dsl"] == MINIMAL_DSL
+    assert result["artifacts"][0]["payload"]["start_id"] == "take_off"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_chat_ignores_openai_reasoning_config(tmp_path):
+    config_path = tmp_path / "client.toml"
+    config_path.write_text(
+        '[client]\nprovider = "anthropic"\nmodel = "claude-sonnet-4-20250514"\n'
+        'anthropic_api_key = "test-key"\nreasoning_effort = "none"\n'
+    )
+    client = SimpleNamespace(messages=SimpleNamespace(create=Mock(return_value=SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="Apply puts the draft into the FSM Builder.")],
+        stop_reason="end_turn",
+    ))))
+    with patch.object(AnthropicProvider, "create_client", return_value=client):
+        await run_chat_turn(
+            [{"role": "user", "content": "What does Apply do?"}], config_path=config_path
+        )
+    request = client.messages.create.call_args.kwargs
+    assert "reasoning_effort" not in request
+    assert "thinking" not in request
+    assert "output_config" not in request
 
 
 @pytest.mark.asyncio

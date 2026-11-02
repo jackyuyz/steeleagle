@@ -51,12 +51,16 @@ def _resolve_api_key(client_cfg: dict, provider: str, cli_api_key: str | None) -
     return key
 
 
-def _create_provider(provider_name: str, base_url: str = ""):
+def _create_provider(
+    provider_name: str, base_url: str = "", reasoning_effort: str | None = None
+):
     """Create and return the appropriate provider instance."""
     if provider_name == "anthropic":
+        # Anthropic Messages has no reasoning_effort parameter; do not forward
+        # this OpenAI-only setting (Claude uses thinking/output_config.effort).
         return AnthropicProvider()
     if provider_name == "openai":
-        return OpenAIProvider(base_url)
+        return OpenAIProvider(base_url, reasoning_effort=reasoning_effort)
     logger.error("Unknown provider '%s'. Supported: anthropic, openai", provider_name)
     sys.exit(1)
 
@@ -149,7 +153,9 @@ async def run_chat(
     client_cfg = config["client"]
     provider_name = cli_provider or client_cfg.get("provider", "anthropic")
     base_url = cli_base_url or client_cfg.get("openai_base_url", "")
-    provider = _create_provider(provider_name, base_url)
+    provider = _create_provider(
+        provider_name, base_url, reasoning_effort=client_cfg.get("reasoning_effort")
+    )
 
     api_key = _resolve_api_key(client_cfg, provider_name, cli_api_key)
     model = cli_model or client_cfg.get("model", provider.default_model)

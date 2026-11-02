@@ -314,6 +314,7 @@ def load_client_settings(config_path: Path | None = None) -> dict[str, Any]:
         "provider": provider,
         "model": model,
         "base_url": base_url,
+        "reasoning_effort": client.get("reasoning_effort"),
         "api_key": api_key,
     }
 
@@ -527,7 +528,10 @@ async def _run_openai(
     tool_payloads: list[dict[str, Any]],
     status: StatusCallback,
 ) -> str:
-    provider = OpenAIProvider(settings.get("base_url") or "")
+    provider = OpenAIProvider(
+        settings.get("base_url") or "",
+        reasoning_effort=settings.get("reasoning_effort"),
+    )
     client = provider.create_client(settings["api_key"])
     tools = provider.tools_to_provider_format(MISSION_TOOLS)
     history: list[dict[str, Any]] = [{"role": "system", "content": system}, *messages]
@@ -540,6 +544,7 @@ async def _run_openai(
             messages=history,
             tools=tools,
             max_completion_tokens=4096,
+            **provider.chat_completion_options(settings["model"]),
         )
         choice = response.choices[0]
         message = choice.message
@@ -596,6 +601,8 @@ async def _run_anthropic(
 
     for _round in range(MAX_TOOL_ROUNDS):
         await status("llm", f"Calling {settings['model']}")
+        # Anthropic Messages has no reasoning_effort parameter. Its separate
+        # thinking/output_config.effort controls are not configured here.
         response = client.messages.create(
             model=settings["model"],
             messages=history,
