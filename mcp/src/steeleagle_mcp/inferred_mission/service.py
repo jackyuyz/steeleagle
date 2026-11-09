@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import io
 import json
 import logging
 import math
 import time
 import uuid
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -36,12 +36,13 @@ class Run:
     records: dict[int, dict] = field(default_factory=dict)
     task: asyncio.Task | None = None
     wake: asyncio.Event = field(default_factory=asyncio.Event)
-    pending: tuple[dict, list[FrameSample]] | None = None
+    pending: deque[int] = field(default_factory=deque)
     frames: list[FrameSample] = field(default_factory=list)
     telemetry: dict | None = None
     anchor: float | None = None
-    last_capture: float = 0.0
+    last_frame_time: float = 0.0
     last_received: float | None = None
+    section_uses_receive_time: bool = False
     index: int = 1
     source_notice: str = "Waiting for timestamped imagery."
 
@@ -70,20 +71,21 @@ class Run:
                 "source_notice": self.source_notice if self.metadata["source_type"] == "live" else ""}
 
 
-def _archive_live(directory: Path, frames: list[FrameSample], side: int) -> tuple[list[FrameSample], list[Path]]:
+def _prepare_live_frames(paths: list[Path], record: dict, side: int) -> list[FrameSample]:
     from PIL import Image
 
-    directory.mkdir(parents=True, exist_ok=False)
-    samples, paths = [], []
-    for index, frame in enumerate(frames, start=1):
-        with Image.open(io.BytesIO(frame.jpeg)) as source:
+    samples = []
+    for path, offset, captured_at, frame_id in zip(
+        paths, record["frame_times"], record["capture_times"], record["frame_ids"], strict=True,
+    ):
+        with Image.open(path) as source:
             image = source.convert("RGB")
-            image.thumbnail((side, side))
-            path = directory / f"{index:04d}.jpg"
-            image.save(path, format="JPEG", quality=88)
-        samples.append(FrameSample(frame.time, path.read_bytes(), frame.capture_time, frame.frame_id))
-        paths.append(path)
-    return samples, paths
+        image.thumbnail((side, side))
+        temporary = path.with_suffix(".tmp")
+        image.save(temporary, format="JPEG", quality=88)
+        temporary.replace(path)
+        samples.append(FrameSample(offset, path.read_bytes(), captured_at, frame_id))
+    return samples
 
 
 class AnalysisService:
@@ -185,9 +187,9 @@ class AnalysisService:
         if run.metadata["status"] == "paused":
             run.save(status="stopped")
         elif run.metadata["status"] in {"observing", "analyzing", "pausing"}:
-            run.save(status="stopping")
             if run.metadata["source_type"] == "live" and run.frames:
                 self._queue_live(run, partial=True)
+            run.save(status="stopping")
             run.wake.set()
 
     async def _run_video(self, run: Run, settings: Settings, runtime: Runtime) -> None:
@@ -236,35 +238,45 @@ class AnalysisService:
         run = self.live.get((feed, vehicle))
         return run is not None and run.metadata["status"] == "observing"
 
-    def ingest(self, vehicle: str, feed: str, captured_at: float, jpeg: bytes,
-               telemetry: dict | None = None, frame_id: int | None = None) -> None:
+    def ingest(self, vehicle: str, feed: str, captured_at: float | None, jpeg: bytes,
+               telemetry: dict | None = None, frame_id: int | None = None,
+               *, received_at: float | None = None) -> None:
         run = self.live.get((feed, vehicle))
         if run is None or run.metadata["status"] != "observing":
             return
         now = time.time()
         earliest = max(now - 30, run.metadata["created_at"] - 5)
-        if not math.isfinite(captured_at) or not earliest <= captured_at <= now + 3:
+        frame_time = received_at if captured_at is None and feed == "local" else captured_at
+        if frame_time is None or not math.isfinite(frame_time) or not earliest <= frame_time <= now + 3:
             run.source_notice = "Waiting for fresh imagery with a valid capture timestamp."
             return
-        if captured_at <= run.last_capture:
+        if frame_time <= run.last_frame_time:
             return
         if run.anchor is None:
-            run.anchor = captured_at
-            run.save(observation_started_at=captured_at)
+            run.anchor = frame_time
+            run.save(observation_started_at=frame_time)
         duration = run.metadata["settings"]["section_seconds"]
-        elapsed = captured_at - run.anchor
+        elapsed = frame_time - run.anchor
         index = math.floor(elapsed / duration) + 1
         if index > run.index:
-            self._queue_live(run)
+            try:
+                self._queue_live(run)
+            except OSError:
+                run.source_notice = "Could not save the section. Check GCS storage."
+                return
             if index > run.index + 1:
                 start = run.index * duration + self._offset(run)
                 end = (index - 1) * duration + self._offset(run)
                 run.record({"index": run.index + 1, "start": start, "end": end, "status": "gap",
                             "error": "No fresh frames were received in this interval."})
             run.index = index
-        run.last_capture = captured_at
-        run.last_received = now
-        run.source_notice = "Receiving timestamped imagery."
+        run.last_frame_time = frame_time
+        run.last_received = received_at if received_at is not None else now
+        run.section_uses_receive_time |= captured_at is None
+        run.source_notice = (
+            "Receiving local imagery using GCS receipt time."
+            if captured_at is None else "Receiving timestamped imagery."
+        )
         relative = elapsed - (index - 1) * duration
         interval = 1 / run.metadata["settings"]["frame_fps"]
         if not run.frames or relative - run.frames[-1].time >= interval - 1e-6:
@@ -279,42 +291,58 @@ class AnalysisService:
     def _queue_live(self, run: Run, *, partial: bool = False) -> None:
         if not run.frames:
             return
-        if run.pending:
-            old, _ = run.pending
-            run.record({**old, "status": "skipped", "error": "A newer live section replaced this pending window."})
         duration = run.metadata["settings"]["section_seconds"]
         start = (run.index - 1) * duration + self._offset(run)
-        observed = max(run.last_capture - run.anchor - (run.index - 1) * duration, 0.001)
+        observed = max(run.last_frame_time - run.anchor - (run.index - 1) * duration, 0.001)
         end = start + (min(duration, observed + 0.001) if partial else duration)
         quality = "partial" if partial or len(run.frames) < math.ceil(duration * run.metadata["settings"]["frame_fps"] / 2) else "complete"
-        record = {"index": run.index, "start": start, "end": end, "telemetry": run.telemetry,
-                  "capture_start": run.anchor + (run.index - 1) * duration, "capture_end": run.last_capture,
+        directory = run.section_dir(run.index) / "frames"
+        directory.mkdir(parents=True, exist_ok=True)
+        files = []
+        for index, frame in enumerate(run.frames, start=1):
+            path = directory / f"{index:04d}.jpg"
+            path.write_bytes(frame.jpeg)
+            files.append(str(path.relative_to(run.directory)))
+        record = {"index": run.index, "start": start, "end": end, "status": "queued", "telemetry": run.telemetry,
+                  "capture_start": None if run.section_uses_receive_time else run.anchor + (run.index - 1) * duration,
+                  "capture_end": None if run.section_uses_receive_time else run.last_frame_time,
+                  "uses_gcs_receive_time": run.section_uses_receive_time,
+                  "frame_files": files, "frame_count": len(files),
+                  "frame_times": [frame.time for frame in run.frames],
+                  "capture_times": [frame.capture_time for frame in run.frames],
+                  "frame_ids": [frame.frame_id for frame in run.frames],
                   "input_quality": quality}
-        run.pending = (record, run.frames)
+        run.record(record)
+        run.pending.append(run.index)
         run.frames = []
+        run.section_uses_receive_time = False
         run.wake.set()
 
     async def _run_live(self, run: Run, key: tuple[str, str], settings: Settings, runtime: Runtime) -> None:
+        status, error = "stopped", None
         try:
             while run.metadata["status"] == "observing" or run.pending:
                 await run.wake.wait()
                 run.wake.clear()
-                if run.pending:
-                    record, frames = run.pending
-                    run.pending = None
-                    await self._process(run, record, settings, runtime, live_frames=frames)
-            run.save(status="stopped")
+                while run.pending:
+                    index = run.pending[0]
+                    await self._process(run, run.records[index], settings, runtime)
+                    run.pending.popleft()
         except asyncio.CancelledError:
-            run.save(status="stopped", error="GCS stopped during observation.")
+            error = "GCS stopped during observation."
             raise
         except Exception:
             logger.exception("Live analysis worker failed")
-            run.save(status="error", error="Live analysis was interrupted. Check GCS logs.")
+            status, error = "error", "Live analysis was interrupted. Check GCS logs."
         finally:
             self.live.pop(key, None)
+            while run.pending:
+                record = run.records[run.pending.popleft()]
+                run.record({**record, "status": "failed", "error": error})
+            run.save(status=status, error=error)
 
     async def _process(self, run: Run, record: dict, settings: Settings, runtime: Runtime,
-                       *, video_path: Path | None = None, live_frames: list[FrameSample] | None = None) -> None:
+                       *, video_path: Path | None = None) -> None:
         started = time.monotonic()
         index = record["index"]
         archived = run.records.get(index, {})
@@ -330,11 +358,12 @@ class AnalysisService:
         run.record(record)
         generation = None
         try:
-            directory = run.section_dir(index) / f"frames-{uuid.uuid4().hex}"
             if video_path:
+                directory = run.section_dir(index) / f"frames-{uuid.uuid4().hex}"
                 frames, paths = await asyncio.to_thread(sample_section, video_path, record["start"], record["end"], directory, settings)
             else:
-                frames, paths = await asyncio.to_thread(_archive_live, directory, live_frames or [], settings.max_frame_side)
+                paths = [run.directory / name for name in record["frame_files"]]
+                frames = await asyncio.to_thread(_prepare_live_frames, paths, record, settings.max_frame_side)
             if not frames:
                 raise ValueError("No decodable frames in this section.")
             records = sorted(run.records.values(), key=lambda row: row["index"])

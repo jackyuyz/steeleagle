@@ -116,9 +116,9 @@ function SectionDetail({ row, session, onApply }) {
                     <summary>Model input · {row.frame_count} sampled frames</summary>
                     <img className="im-media" src={`${path}/frames/${shownFrame}`} alt={`Sampled frame ${shownFrame + 1}`} />
                     <label className="im-frame-control">
-                        Frame {shownFrame + 1} · +{row.frame_times[shownFrame]} s
                         <input aria-label="Sampled frame" type="range" min="0" max={row.frame_count - 1}
                             value={shownFrame} onChange={event => setFrameIndex(Number(event.target.value))} />
+                        <span>Frame {shownFrame + 1} · +{row.frame_times[shownFrame]} s</span>
                     </label>
                 </details>
             )}
@@ -199,7 +199,9 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     const [now, setNow] = useState(() => Date.now() / 1000);
     const session = snapshot?.id === sessionId ? snapshot : null;
     const active = Boolean(session && ACTIVE.has(session.status));
-    const index = selectedIndex ?? session?.sections?.at(-1)?.index;
+    const queuedCount = session?.sections?.filter(row => row.status === 'queued').length ?? 0;
+    const index = selectedIndex ?? session?.sections?.findLast(row => row.status !== 'queued')?.index
+        ?? session?.sections?.at(-1)?.index;
     const summary = session?.sections?.find(row => row.index === index);
     const detailStatus = summary?.status;
 
@@ -321,7 +323,7 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                             <option value="recency">Recency</option><option value="uniform">Uniform</option>
                             <option value="no_memory">No memory</option>
                         </select></label>
-                        <span className="im-badge">Analysis only · prompt {config?.prompt_version || 'v5'}</span>
+                        <span className="im-badge">Analysis only</span>
                     </div>
                 </div>
                 {videoMode ? (
@@ -379,6 +381,7 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                     {session.video_takeoff_offset != null ? 'Time relative to supplied takeoff offset' :
                         session.video ? 'Video time' : session.time_basis === 'takeoff' ? 'Time since takeoff' : 'Time since observation began'}
                     {' · '}{session.sections.length}{session.total_sections ? ` / ${session.total_sections}` : ''} sections
+                    {queuedCount > 0 && ` · ${queuedCount} queued`}
                     {active && session.source_type === 'live' && ` · ${session.source_notice}`}
                     {active && session.collecting_section != null && ` Section ${session.collecting_section} collecting (${session.collecting_frames} frames).`}
                     {active && frameAge != null && ` Last frame ${frameAge}s ago${frameAge > 5 ? ' (stale)' : ''}.`}

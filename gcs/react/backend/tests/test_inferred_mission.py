@@ -139,7 +139,7 @@ async def test_live_sections_use_capture_time_and_isolate_sources(tmp_path, monk
         run_id = created.json()["id"]
         stamp = time.time() - 3
         service.ingest("other-drone", "local", stamp - 10, jpeg)
-        service.ingest("test-drone", "local", stamp - 120, jpeg)
+        service.ingest("test-drone", "local", stamp - 120, jpeg, received_at=stamp)
         service.ingest("test-drone", "local", stamp, jpeg)
         service.ingest("test-drone", "local", stamp, jpeg)
         service.ingest("test-drone", "local", stamp + 1, jpeg)
@@ -153,6 +153,45 @@ async def test_live_sections_use_capture_time_and_isolate_sources(tmp_path, monk
         assert stopped["sections"][1]["status"] == "completed"
         assert not service.active_live("test-drone", "local")
     await service.close()
+
+
+@pytest.mark.asyncio
+async def test_local_broadcaster_uses_receipt_time_for_untimestamped_simulator_frames(tmp_path, monkeypatch):
+    from app import api
+    from steeleagle_sdk.protocol.messages.telemetry_pb2 import Frame
+
+    app, prompts = analysis_app(tmp_path, monkeypatch)
+    service = app.state.inferred_mission
+    monkeypatch.setattr(api.app.state, "inferred_mission", service, raising=False)
+    messages = asyncio.Queue()
+
+    class LocalSocket:
+        async def recv(self, *, flags):
+            return await messages.get()
+
+    frame = Frame(id=42, h_res=32, v_res=32, channels=3, data=bytes(32 * 32 * 3))
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/api/inferred-mission/sessions", json={"source_type": "live", "vehicle_id": "test-drone"})
+        assert created.status_code == 201, created.text
+        run_id = created.json()["id"]
+        broadcaster = asyncio.create_task(api._imagery_broadcaster(LocalSocket(), "test-drone"))
+        try:
+            await messages.put(frame.SerializeToString())
+            collecting = await wait_for(client, run_id, lambda r: r["collecting_frames"] == 1)
+            assert collecting["source_notice"] == "Receiving local imagery using GCS receipt time."
+            await asyncio.sleep(1.05)
+            frame.id += 1
+            await messages.put(frame.SerializeToString())
+            await wait_for(client, run_id, lambda r: r["sections"] and r["sections"][0]["status"] == "completed")
+            row = (await client.get(f"/api/inferred-mission/sessions/{run_id}/sections/1")).json()
+            assert row["uses_gcs_receive_time"]
+            assert row["capture_times"] == [None]
+            assert row["frame_ids"] == [42]
+            assert len(prompts[0][1]) == 1
+        finally:
+            broadcaster.cancel()
+            await asyncio.gather(broadcaster, return_exceptions=True)
+            await service.close()
 
 
 @pytest.mark.asyncio

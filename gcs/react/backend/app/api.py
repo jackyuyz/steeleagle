@@ -453,6 +453,7 @@ async def _imagery_broadcaster(sock, name: str):
             try:
                 # Receive message from ZeroMQ (non-blocking)
                 message = await sock.recv(flags=zmq.DONTWAIT)
+                received_at = time.time()
                 frame = Frame()
                 frame.ParseFromString(message)
                 encoded_img = Image.frombuffer(
@@ -464,7 +465,10 @@ async def _imagery_broadcaster(sock, name: str):
 
                 jpeg = img_bytes.getvalue()
                 if app.state.inferred_mission.active_live(name, "local"):
-                    app.state.inferred_mission.ingest(name, "local", capture_time(frame), jpeg, telemetry_from_frame(frame), frame.id)
+                    app.state.inferred_mission.ingest(
+                        name, "local", capture_time(frame), jpeg, telemetry_from_frame(frame), frame.id,
+                        received_at=received_at,
+                    )
 
                 # Encode to base64 and broadcast to all connected clients
                 base64_image = base64.b64encode(jpeg).decode("ascii")

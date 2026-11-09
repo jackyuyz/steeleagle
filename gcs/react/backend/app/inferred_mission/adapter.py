@@ -69,8 +69,11 @@ def runtime(settings: Settings, *, require_key: bool = True) -> tuple[Runtime, b
     return Runtime(models, infer, generate), configured
 
 
-def capture_time(frame: Frame) -> float:
-    return frame.timestamp.seconds + frame.timestamp.nanos / 1_000_000_000
+def capture_time(frame: Frame) -> float | None:
+    timestamp = frame.timestamp
+    if timestamp.seconds == 0 and timestamp.nanos == 0:
+        return None
+    return timestamp.seconds + timestamp.nanos / 1_000_000_000
 
 
 def telemetry_from_frame(frame: Frame) -> dict | None:
