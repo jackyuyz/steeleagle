@@ -42,7 +42,7 @@ def test_compile_transitions():
             CompileNode(
                 instance_id="patrol",
                 type_name="Patrol",
-                params={"waypoints": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
+                params={"plan": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
             ),
         ],
         events=[],
@@ -63,7 +63,7 @@ def test_compile_with_events():
             CompileNode(
                 instance_id="patrol",
                 type_name="Patrol",
-                params={"waypoints": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
+                params={"plan": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
             ),
             CompileNode(
                 instance_id="track",
@@ -158,7 +158,7 @@ def test_compile_dangling_edge_returns_error():
             CompileNode(
                 instance_id="patrol",
                 type_name="Patrol",
-                params={"waypoints": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
+                params={"plan": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
             )
         ],
         events=[],
@@ -178,7 +178,7 @@ def test_compile_duplicate_instance_id_returns_error():
             CompileNode(
                 instance_id="patrol",
                 type_name="Patrol",
-                params={"waypoints": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
+                params={"plan": {"area": "AreaB", "alt": 15.0, "algo": "edge"}},
             ),
             CompileNode(
                 instance_id="patrol",

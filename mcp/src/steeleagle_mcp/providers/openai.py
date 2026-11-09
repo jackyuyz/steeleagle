@@ -2,22 +2,36 @@
 # SPDX-License-Identifier: 0BSD
 """OpenAI provider implementation for MCP client."""
 
+import asyncio
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from openai import OpenAI
 
+from steeleagle_mcp.config import DEFAULT_OPENAI_MODEL
 from steeleagle_mcp.providers import LLMProvider
 
 logger = logging.getLogger("provider.openai")
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: str
+
+
+def _uses_responses(model: str) -> bool:
+    return model == "gpt-6.1-sol" or model.startswith("gpt-6.1-sol-")
 
 
 class OpenAIProvider(LLMProvider):
     """Provider implementation for OpenAI models."""
 
     name = "openai"
-    default_model = "gpt-4o"
+    default_model = DEFAULT_OPENAI_MODEL
 
     def __init__(
         self, base_url: str = "", reasoning_effort: str | None = None
@@ -28,6 +42,8 @@ class OpenAIProvider(LLMProvider):
 
     def chat_completion_options(self, model: str) -> dict[str, str]:
         """Shared OpenAI request options for MCP and GCS Chat tool loops."""
+        if _uses_responses(model):
+            raise ValueError("GPT-6.1 Sol tool calling requires the Responses API.")
         # Legacy chat models do not accept reasoning_effort, even if it remains
         # in the config after switching models (including a CLI --model override).
         if model.startswith(("gpt-4", "gpt-3.5")):
@@ -50,6 +66,17 @@ class OpenAIProvider(LLMProvider):
             raise ValueError(f"Invalid OpenAI reasoning_effort: {effort!r}")
         return {"reasoning_effort": effort}
 
+    def responses_reasoning_options(self, model: str) -> dict:
+        if model.startswith(("gpt-4", "gpt-3.5")):
+            return {}
+        effort = self._reasoning_effort
+        if _uses_responses(model):
+            if effort is None:
+                effort = "medium"
+            if effort not in ("low", "medium", "high", "xhigh", "max"):
+                raise ValueError("GPT-6.1 Sol reasoning_effort must be low, medium, high, xhigh, or max.")
+        return {"reasoning": {"effort": effort}} if effort is not None else {}
+
     def create_client(self, api_key: str) -> OpenAI:
         """Create and return an OpenAI client instance."""
         if self._base_url:
@@ -70,6 +97,45 @@ class OpenAIProvider(LLMProvider):
             for tool in mcp_tools
         ]
 
+    def request_tool_turn(
+        self, client: OpenAI, model: str, messages: list[dict],
+        instructions: str, tools: list[dict],
+    ) -> tuple[dict, list[ToolCall]]:
+        """Request one model turn for either MCP or the GCS mission tools."""
+        if _uses_responses(model):
+            inputs = []
+            for message in messages:
+                if "response_items" in message:
+                    inputs.extend(message["response_items"])
+                elif message["role"] == "tool":
+                    inputs.append({"type": "function_call_output", "call_id": message["tool_call_id"],
+                                   "output": message["content"]})
+                else:
+                    inputs.append(message)
+            response = client.responses.create(
+                model=model, instructions=instructions, input=inputs,
+                tools=[{"type": "function", **tool["function"], "strict": False} for tool in tools],
+                max_output_tokens=4096, store=False, include=["reasoning.encrypted_content"],
+                **self.responses_reasoning_options(model),
+            )
+            if response.status != "completed":
+                raise RuntimeError(f"OpenAI Responses turn did not complete ({response.status}).")
+            # Preserve native function calls and reasoning items for stateless continuation.
+            assistant = {"role": "assistant", "content": response.output_text,
+                         "response_items": [item.model_dump(exclude_none=True) for item in response.output]}
+            calls = [ToolCall(item.call_id, item.name, item.arguments) for item in response.output
+                     if item.type == "function_call"]
+            return assistant, calls
+
+        response = client.chat.completions.create(
+            model=model, messages=[{"role": "system", "content": instructions}, *messages],
+            tools=tools, max_completion_tokens=4096, **self.chat_completion_options(model),
+        )
+        message = response.choices[0].message
+        assistant = {**message.model_dump(exclude_none=True), "role": "assistant"}
+        calls = [ToolCall(call.id, call.function.name, call.function.arguments) for call in message.tool_calls or []]
+        return assistant, calls
+
     async def agentic_loop(
         self,
         client: OpenAI,
@@ -80,38 +146,17 @@ class OpenAIProvider(LLMProvider):
         model: str,
     ) -> None:
         """Run one LLM turn: send messages, execute any tool calls."""
-        messages_with_system = [
-            {"role": "system", "content": system_prompt},
-            *messages,
-        ]
-
         logger.info("LLM request  model=%s messages=%d", model, len(messages))
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages_with_system,
-            tools=provider_tools,
-            max_completion_tokens=4096,
-            **self.chat_completion_options(model),
+        assistant, calls = await asyncio.to_thread(
+            self.request_tool_turn, client, model, messages, system_prompt, provider_tools,
         )
-
-        choice = response.choices[0]
-        message = choice.message
-        n_tools = len(message.tool_calls) if message.tool_calls else 0
-        logger.info("LLM response  finish=%s tools=%d content=%s",
-                 choice.finish_reason, n_tools, (message.content or "")[:120])
-
-        assistant_msg = message.model_dump(exclude_none=True)
-        # ensure role is present
-        assistant_msg["role"] = "assistant"
-        messages.append(assistant_msg)
-        if message.tool_calls:
-            for i, tc in enumerate(message.tool_calls):
-                logger.info("tool [%d/%d] %s(%s)", i + 1, n_tools,
-                         tc.function.name, tc.function.arguments)
-                result = await _execute_tool(session, tc)
-                logger.info("tool [%d/%d] %s -> %s", i + 1, n_tools,
-                         tc.function.name, result["content"][:120])
-                messages.append(result)
+        messages.append(assistant)
+        logger.info("LLM response  tools=%d content=%s", len(calls), (assistant.get("content") or "")[:120])
+        for i, call in enumerate(calls, start=1):
+            logger.info("tool [%d/%d] %s(%s)", i, len(calls), call.name, call.arguments)
+            result = await _execute_tool(session, call)
+            logger.info("tool [%d/%d] %s -> %s", i, len(calls), call.name, result["content"][:120])
+            messages.append(result)
 
     def tool_call_to_id(self, tool_call: Any) -> str:
         """Extract tool call ID from an OpenAI tool call."""
@@ -122,11 +167,10 @@ class OpenAIProvider(LLMProvider):
         return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
 
-async def _execute_tool(session: Any, tool_call: Any) -> dict[str, Any]:
+async def _execute_tool(session: Any, tool_call: ToolCall) -> dict[str, Any]:
     """Execute an MCP tool and return the result as a message."""
-    name = tool_call.function.name
-    raw = tool_call.function.arguments
-    args = json.loads(raw) if isinstance(raw, str) and raw else raw if isinstance(raw, dict) else {}
+    name = tool_call.name
+    args = json.loads(tool_call.arguments) if tool_call.arguments else {}
 
     try:
         result = await session.call_tool(name, args)

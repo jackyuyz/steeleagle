@@ -40,19 +40,34 @@ def test_openai_rejects_unknown_reasoning_effort():
         OpenAIProvider(reasoning_effort="invalid").chat_completion_options("gpt-5")
 
 
-@pytest.mark.parametrize("effort", ["none", None])
-def test_mcp_config_reaches_every_openai_tool_round(tmp_path, effort):
+@pytest.mark.parametrize(("model", "effort"), [
+    ("gpt-6-sol", "none"), ("gpt-6-sol", None), ("gpt-6.1-sol", "medium"), ("gpt-6.1-sol", None),
+])
+def test_mcp_config_reaches_every_openai_tool_round(tmp_path, model, effort):
     config_path = tmp_path / "client.toml"
     config_path.write_text(
-        '[client]\nprovider = "openai"\nmodel = "gpt-6-sol"\n'
+        f'[client]\nprovider = "openai"\nmodel = "{model}"\n'
         'openai_api_key = "test-key"\n'
-        + ('reasoning_effort = "none"\n' if effort else "")
+        + (f'reasoning_effort = "{effort}"\n' if effort else "")
     )
     requests = []
 
     def handle(request):
         body = json.loads(request.content)
         requests.append(body)
+        if model == "gpt-6.1-sol":
+            assert request.url.path == "/v1/responses"
+            if len(requests) == 1:
+                output = [
+                    {"id": "rs_1", "type": "reasoning", "summary": [], "encrypted_content": "reasoning-fixture"},
+                    {"id": "fc_1", "type": "function_call", "call_id": "call-compile",
+                     "name": "compile_mission_dsl", "arguments": "{}", "status": "completed"},
+                ]
+            else:
+                output = [{"id": "msg_1", "type": "message", "role": "assistant", "status": "completed",
+                           "content": [{"type": "output_text", "text": "Mission ready.", "annotations": []}]}]
+            return httpx.Response(200, json={"id": "resp-test", "object": "response", "created_at": 0,
+                                             "model": model, "status": "completed", "output": output})
         message = {"role": "assistant", "content": "Mission ready."}
         if len(requests) == 1:
             message = {
@@ -104,9 +119,18 @@ def test_mcp_config_reaches_every_openai_tool_round(tmp_path, effort):
             asyncio.run(run_chat(load_config(str(config_path)), None, None, None, None))
 
     assert len(requests) == 2
-    assert all(r["model"] == "gpt-6-sol" for r in requests)
-    assert all(r["reasoning_effort"] == "none" for r in requests)
-    assert requests[1]["messages"][-1]["role"] == "tool"
+    assert all(r["model"] == model for r in requests)
+    if model == "gpt-6.1-sol":
+        assert all(r["reasoning"] == {"effort": "medium"} and r["store"] is False for r in requests)
+        assert requests[0]["tools"][0]["name"] == "compile_mission_dsl"
+        assert requests[0]["tools"][0]["strict"] is False
+        assert requests[1]["input"][1]["encrypted_content"] == "reasoning-fixture"
+        assert requests[1]["input"][-1] == {
+            "type": "function_call_output", "call_id": "call-compile", "output": '{"ok": true}',
+        }
+    else:
+        assert all(r["reasoning_effort"] == "none" for r in requests)
+        assert requests[1]["messages"][-1]["role"] == "tool"
     session.call_tool.assert_awaited_once_with("compile_mission_dsl", {})
 
 

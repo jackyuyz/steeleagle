@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -304,8 +305,9 @@ def load_client_settings(config_path: Path | None = None) -> dict[str, Any]:
     cfg = load_config(str(path) if path.is_file() else None)
     client = cfg.get("client") or {}
     provider = (client.get("provider") or "openai").strip().lower()
+    # Default to OpenAI is preferred for now
     model = client.get("model") or (
-        "gpt-4o" if provider == "openai" else "claude-sonnet-4-20250514"
+        OpenAIProvider.default_model if provider == "openai" else AnthropicProvider.default_model
     )
     base_url = (client.get("openai_base_url") or "").strip()
     api_key = resolve_api_key(client, provider)
@@ -527,48 +529,48 @@ async def _run_openai(
     system: str,
     tool_payloads: list[dict[str, Any]],
     status: StatusCallback,
+    *,
+    analysis_dispatch: Callable[[str, dict], dict] | None = None,
 ) -> str:
     provider = OpenAIProvider(
         settings.get("base_url") or "",
         reasoning_effort=settings.get("reasoning_effort"),
     )
     client = provider.create_client(settings["api_key"])
+    if analysis_dispatch is not None:
+        client = client.with_options(timeout=settings["request_timeout"], max_retries=0)
     tools = provider.tools_to_provider_format(MISSION_TOOLS)
-    history: list[dict[str, Any]] = [{"role": "system", "content": system}, *messages]
+    history: list[dict[str, Any]] = list(messages)
     final_text = ""
 
     for _round in range(MAX_TOOL_ROUNDS):
         await status("llm", f"Calling {settings['model']}")
-        response = client.chat.completions.create(
-            model=settings["model"],
-            messages=history,
-            tools=tools,
-            max_completion_tokens=4096,
-            **provider.chat_completion_options(settings["model"]),
+        assistant, tool_calls = await asyncio.to_thread(
+            provider.request_tool_turn, client, settings["model"], history, system, tools,
         )
-        choice = response.choices[0]
-        message = choice.message
-        assistant_msg = message.model_dump(exclude_none=True)
-        assistant_msg["role"] = "assistant"
-        history.append(assistant_msg)
+        history.append(assistant)
 
-        if message.content:
-            final_text = message.content
-
-        tool_calls = message.tool_calls or []
+        if assistant.get("content"):
+            final_text = assistant["content"]
         if not tool_calls:
             break
 
         for tc in tool_calls:
-            name = tc.function.name
-            raw = tc.function.arguments
+            name = tc.name
+            raw = tc.arguments
             try:
                 args = json.loads(raw) if isinstance(raw, str) and raw else {}
             except json.JSONDecodeError:
                 args = {}
             await status("tool", f"Running {name}")
-            payload = dispatch_tool(name, args if isinstance(args, dict) else {})
+            arguments = args if isinstance(args, dict) else {}
+            if analysis_dispatch is None:
+                payload = dispatch_tool(name, arguments)
+            else:
+                payload = await asyncio.to_thread(analysis_dispatch, name, arguments)
             tool_payloads.append(payload)
+            if analysis_dispatch is not None and name == "compile_mission_dsl" and payload.get("ok"):
+                return final_text
             history.append(
                 {
                     "role": "tool",
@@ -592,9 +594,13 @@ async def _run_anthropic(
     system: str,
     tool_payloads: list[dict[str, Any]],
     status: StatusCallback,
+    *,
+    analysis_dispatch: Callable[[str, dict], dict] | None = None,
 ) -> str:
     provider = AnthropicProvider()
     client = provider.create_client(settings["api_key"])
+    if analysis_dispatch is not None:
+        client = client.with_options(timeout=settings["request_timeout"], max_retries=0)
     tools = provider.tools_to_provider_format(MISSION_TOOLS)
     history: list[dict[str, Any]] = list(messages)
     final_text = ""
@@ -603,7 +609,8 @@ async def _run_anthropic(
         await status("llm", f"Calling {settings['model']}")
         # Anthropic Messages has no reasoning_effort parameter. Its separate
         # thinking/output_config.effort controls are not configured here.
-        response = client.messages.create(
+        response = await asyncio.to_thread(
+            client.messages.create,
             model=settings["model"],
             messages=history,
             system=system,
@@ -625,8 +632,13 @@ async def _run_anthropic(
             name = block.name
             args = block.input if isinstance(block.input, dict) else {}
             await status("tool", f"Running {name}")
-            payload = dispatch_tool(name, args)
+            if analysis_dispatch is None:
+                payload = dispatch_tool(name, args)
+            else:
+                payload = await asyncio.to_thread(analysis_dispatch, name, args)
             tool_payloads.append(payload)
+            if analysis_dispatch is not None and name == "compile_mission_dsl" and payload.get("ok"):
+                return final_text
             result_content.append(
                 {
                     "type": "tool_result",
@@ -643,6 +655,31 @@ async def _run_anthropic(
         )
 
     return final_text or ""
+
+
+async def run_analysis_generation(settings: dict, instruction: str, reference: dict,
+                                  tool_dispatch: Callable[[str, dict], dict]) -> None:
+    """Run the mission-only tool loop against a section's frozen reference."""
+    def dispatch(name: str, args: dict) -> dict:
+        if name == "translate_with_dsl_reference":
+            return reference
+        return tool_dispatch(name, args)
+
+    messages = [{"role": "user", "content": json.dumps({
+        "instruction": instruction, "dsl_reference": reference["reference"],
+    }, ensure_ascii=False)}]
+    runner = _run_openai if settings["provider"] == "openai" else _run_anthropic
+    results: list[dict] = []
+    content = await runner(
+        settings, messages,
+        "Generate a reviewable SteelEagle DSL candidate for the instruction. Use the supplied reference. "
+        "Call compile_mission_dsl and fix any reported errors. The only allowed tools are reference and compile. "
+        "Preserve the instruction's tasks, parameters and conditions. Do not execute the mission.",
+        results, _noop_status, analysis_dispatch=dispatch,
+    )
+    if not any(result.get("ok") and "mission_json" in result for result in results):
+        if dsl := _extract_dsl_fence(content):
+            await asyncio.to_thread(tool_dispatch, "compile_mission_dsl", {"dsl": dsl})
 
 
 async def iter_chat_events(

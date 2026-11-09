@@ -119,6 +119,9 @@ gcs/cli/mission.json
 gcs/cli/drones.toml
 
 mcp/test/config.toml
+mcp/config.toml
+mcp/inference.toml
+mcp/inferred_mission_data/
 
 # Superpowers scratch space (ledgers, brainstorm artifacts)
 .superpowers/

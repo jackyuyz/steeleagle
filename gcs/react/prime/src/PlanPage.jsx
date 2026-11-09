@@ -20,6 +20,7 @@ import ConnectModal from './ConnectModal.jsx';
 import { getApiUrl } from './App.jsx';
 import { runValidation } from './validation.js';
 import ChatPage from './chat/ChatPage.jsx';
+import InferredMissionPage from './inferred-mission/InferredMissionPage.jsx';
 
 const nodeTypes = { taskNode: TaskNode };
 const edgeTypes = { selfLoop: SelfLoopEdge };
@@ -896,6 +897,10 @@ function PlanPage({ vehicles, squadList, theme }) {
 
                 <TabPanel header="Chat" leftIcon="pi pi-comments mr-2" headerClassName="mr-2">
                     <ChatPage onApplyArtifact={handleApplyArtifact} />
+                </TabPanel>
+
+                <TabPanel header="Inferred Mission" leftIcon="pi pi-video mr-2" headerClassName="mr-2">
+                    <InferredMissionPage vehicles={vehicles} onApplyArtifact={handleApplyArtifact} />
                 </TabPanel>
 
                 <TabPanel header="DSL Preview" leftIcon="pi pi-code mr-2" headerClassName="mr-2">

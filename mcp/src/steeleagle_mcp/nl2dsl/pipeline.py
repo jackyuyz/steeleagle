@@ -23,9 +23,10 @@ class PipelineOutcome:
     auto_fixes: list[str]
     errors: list[ValidationError]
     mission_ir: dict[str, Any] | None
+    compiler_available: bool | None = None
 
 
-def run_dsl_through_pipeline(dsl_code: str) -> PipelineOutcome:
+def run_dsl_through_pipeline(dsl_code: str, *, require_sdk: bool = False) -> PipelineOutcome:
     """Normalize, validate, and compile a DSL candidate."""
     dsl_code, auto_fixes = normalize_dsl(dsl_code)
     errors = validate(dsl_code)
@@ -33,14 +34,15 @@ def run_dsl_through_pipeline(dsl_code: str) -> PipelineOutcome:
         return PipelineOutcome(False, dsl_code, auto_fixes, errors, None)
 
     comp = compile_dsl(dsl_code)
-    if comp.available and not comp.ok:
+    if not comp.ok and (comp.available or require_sdk):
         return PipelineOutcome(
             False,
             dsl_code,
             auto_fixes,
             [ValidationError(None, f"SDK compiler error: {comp.error}")],
             None,
+            comp.available,
         )
 
     mission_ir = comp.mission_json if comp.ok else to_mission_ir(dsl_code)
-    return PipelineOutcome(True, dsl_code, auto_fixes, [], mission_ir)
+    return PipelineOutcome(True, dsl_code, auto_fixes, [], mission_ir, comp.available)

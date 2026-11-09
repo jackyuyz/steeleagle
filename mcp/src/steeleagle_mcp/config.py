@@ -56,12 +56,15 @@ DEFAULT_COMPUTE_CONFIG = {
     "db_path": "mcp_mission.db",
 }
 
+DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"
+DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+
 DEFAULT_CLIENT_CONFIG = {
-    "provider": "anthropic",
+    "provider": "openai",
     "anthropic_api_key": "",
     "openai_api_key": "",
     "openai_base_url": "",
-    "model": "claude-sonnet-4-20250514",
+    "model": DEFAULT_OPENAI_MODEL,
 }
 
 DEFAULT_PORT = 8080
@@ -75,10 +78,15 @@ def load_config(config_path: str | None) -> dict:
     else:
         raw = {}
 
+    client_settings = raw.get("client", {})
+    client = {**DEFAULT_CLIENT_CONFIG, **client_settings}
+    if client["provider"] == "anthropic" and "model" not in client_settings:
+        client["model"] = DEFAULT_ANTHROPIC_MODEL
+
     return {
         "drone": {**DEFAULT_DRONE_CONFIG, **raw.get("drone", {})},
         "compute": {**DEFAULT_COMPUTE_CONFIG, **raw.get("compute", {})},
-        "client": {**DEFAULT_CLIENT_CONFIG, **raw.get("client", {})},
+        "client": client,
     }
 
 

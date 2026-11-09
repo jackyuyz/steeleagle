@@ -7,6 +7,7 @@ from typing import Any
 
 from anthropic import Anthropic
 
+from steeleagle_mcp.config import DEFAULT_ANTHROPIC_MODEL
 from steeleagle_mcp.providers import LLMProvider
 
 logger = logging.getLogger("provider.anthropic")
@@ -16,7 +17,7 @@ class AnthropicProvider(LLMProvider):
     """Provider implementation for Anthropic's Claude models."""
 
     name = "anthropic"
-    default_model = "claude-sonnet-4-20250514"
+    default_model = DEFAULT_ANTHROPIC_MODEL
 
     def __init__(self) -> None:
         self._client_class = Anthropic

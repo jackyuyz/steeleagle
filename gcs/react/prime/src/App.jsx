@@ -74,7 +74,7 @@ function App() {
   const [showDetections, setShowDetections] = useState(true);
   const [gamepadDeadzone, setGamepadDeadzone] = useState(10);
   const [squadList, setSquadList] = useState(null);
-  const [socketUrl, setSocketUrl] = useState('');
+  const [socketUrl, setSocketUrl] = useState(null);
   const op = useRef(null);
   // Keep a ref to the last-known vehicles JSON so we can skip setVehicles when
   // the server returns identical data, preventing needless re-renders.
@@ -85,7 +85,9 @@ function App() {
   }, [selectedMenu]);
 
   useEffect(() => {
-    if (useLocalVehicle) {
+    if (!selectedVehicle) {
+      setSocketUrl(null);
+    } else if (useLocalVehicle) {
       setSocketUrl(getWebSocketUrl(`/ws/imagery/${selectedVehicle}`));
     } else {
       setSocketUrl(getWebSocketUrl(`/ws/imagery/remote/${selectedVehicle}`));

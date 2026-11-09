@@ -1,0 +1,19 @@
+# Copy to inference.toml beside the MCP config to customize the analysis page.
+# Credentials come from mcp/config.toml or OPENAI_API_KEY.
+[inferred_mission]
+vision_model = "gpt-6.1-sol"
+vision_reasoning_effort = "medium"
+section_seconds = 15.0
+frame_fps = 1.0
+max_frame_side = 768
+# history mode "recency" gives more weight to recent inferences using half_life_sections.
+# history mode "uniform" gives all selected prior inferences equal weight.
+# history mode "no_memory" omits prior inferences from the prompt.
+history_mode = "recency"
+history_sections = 10
+half_life_sections = 3.0
+request_timeout = 60.0
+generation_timeout = 120.0
+max_video_bytes = 1073741824
+max_video_seconds = 3600.0
+max_active_runs = 4

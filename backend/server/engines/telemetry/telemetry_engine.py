@@ -280,6 +280,11 @@ class TelemetryEngine(cognitive_engine.Engine):
                 os.rename(
                     f"{vehicle_raw_dir}/temp.jpg", f"{vehicle_raw_dir}/latest.jpg"
                 )
+                # Keep raw imagery and its capture timestamp together for GCS inference.
+                # The display JPEG has a watermark and its HTTP timestamp is not a capture time.
+                with open(f"{vehicle_raw_dir}/temp.frame", "wb") as raw_frame:
+                    raw_frame.write(frame.SerializeToString())
+                os.replace(f"{vehicle_raw_dir}/temp.frame", f"{vehicle_raw_dir}/latest.frame")
                 resampled_out = BytesIO()
                 img.thumbnail((320, 240), Image.LANCZOS)
                 img.save(resampled_out, format="JPEG")

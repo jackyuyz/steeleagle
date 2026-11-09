@@ -72,6 +72,7 @@ from app.dsl_graph import (
     init_dsl_parser,
     parse_dsl_to_graph,
 )
+from app.inferred_mission.adapter import capture_time, create_service, telemetry_from_frame
 
 IDENTITY_MD = (("identity", "server"),)
 FORMAT = "%(message)s"
@@ -264,7 +265,14 @@ connection_manager = ConnectionManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for v in cfg["vehicle"]:
+    app.state.inferred_mission = create_service()
+    app.state.inferred_mission_local_vehicles = vehicle_connections
+    app.state.inferred_mission_remote_webserver = None
+    app.state.inferred_mission_source_tasks = set()
+    app.state.inferred_mission_upload_lock = asyncio.Lock()
+    await asyncio.to_thread(app.state.inferred_mission.recover)
+
+    for v in cfg.get("vehicle", {}):
         vehicle = cfg["vehicle"][v]
         logger.info(f"Creating connections to vehicle {v}...")
         channel = grpc.aio.insecure_channel(vehicle["address"])
@@ -309,7 +317,7 @@ async def lifespan(app: FastAPI):
             )
         )
 
-    for b in cfg["backend"]:
+    for b in cfg.get("backend", {}):
         backend = cfg["backend"][b]
         swarm_controller_channel = grpc.aio.insecure_channel(
             backend["swarm-controller"]
@@ -337,10 +345,12 @@ async def lifespan(app: FastAPI):
             show_detections=True,
         )
         backend_connections[b] = bc
-    if backend_key is not None:
+    if backend_key is not None and backend_key in backend_connections:
         logger.info(f"Using backend '{backend_key}' based on BACKEND env var")
-    else:
+        app.state.inferred_mission_remote_webserver = backend_connections[backend_key].webserver
+    elif backend_connections:
         logger.info(f"Using default backend '{list(backend_connections.keys())[0]}'")
+        app.state.inferred_mission_remote_webserver = next(iter(backend_connections.values())).webserver
 
     _dsl_load_all()
 
@@ -351,6 +361,11 @@ async def lifespan(app: FastAPI):
         logger.warning(f"DSL parser init failed: {exc}")
 
     yield
+    source_tasks = list(app.state.inferred_mission_source_tasks)
+    for task in source_tasks:
+        task.cancel()
+    await asyncio.gather(*source_tasks, return_exceptions=True)
+    await app.state.inferred_mission.close()
     # Cleanup
     for _name, conn in backend_connections.items():
         await conn.grpc_channel.close()
@@ -447,8 +462,12 @@ async def _imagery_broadcaster(sock, name: str):
                 img_bytes = io.BytesIO()
                 encoded_img.save(img_bytes, format="JPEG")
 
+                jpeg = img_bytes.getvalue()
+                if app.state.inferred_mission.active_live(name, "local"):
+                    app.state.inferred_mission.ingest(name, "local", capture_time(frame), jpeg, telemetry_from_frame(frame), frame.id)
+
                 # Encode to base64 and broadcast to all connected clients
-                base64_image = base64.b64encode(img_bytes.getvalue()).decode("ascii")
+                base64_image = base64.b64encode(jpeg).decode("ascii")
                 await connection_manager.broadcast(name, base64_image)
 
             except zmq.Again:
@@ -471,7 +490,7 @@ async def _remote_imagery_broadcaster(vehicle: str):
     while connection_manager.get_client_count(f"remote_{vehicle}") > 0:
         try:
             url = f"{conn.webserver}/raw/{vehicle}/latest.jpg?t={time.time()}"
-            response = requests.get(url, timeout=5)
+            response = await asyncio.to_thread(requests.get, url, timeout=5)
             if response.status_code == 200:
                 img_bytes = response.content
                 if conn.show_detections:
@@ -601,7 +620,9 @@ async def get_backends() -> list[str]:
 
 
 @app.get("/api/remote/objects")
-async def get_objects() -> list[Detection]:
+def get_objects() -> list[Detection]:
+    if not backend_connections:
+        return []
     data = []
     if backend_key is None:
         conn = backend_connections[list(backend_connections)[0]].redis_connection
@@ -630,7 +651,9 @@ async def get_objects() -> list[Detection]:
 
 
 @app.get("/api/remote/vehicles")
-async def get_vehicles() -> list[Vehicle]:
+def get_vehicles() -> list[Vehicle]:
+    if not backend_connections:
+        return []
     data = []
     current = Location(lat=42, long=-79, alt=0)
     bearing = 0
@@ -1316,8 +1339,11 @@ async def compile_mission_route(request: CompileRequest) -> dict:
 
 
 from app.chat import router as chat_router
+from app.inferred_mission.routes import router as inferred_mission_router
 
 app.include_router(chat_router)
+app.include_router(inferred_mission_router)
 
-# Serve Vite static files
-app.mount("/", StaticFiles(directory="../prime/dist", html=True), name="react_app")
+# Vite serves the frontend separately in development before a build exists.
+if Path("../prime/dist").is_dir():
+    app.mount("/", StaticFiles(directory="../prime/dist", html=True), name="react_app")

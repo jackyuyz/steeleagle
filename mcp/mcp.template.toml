@@ -14,14 +14,15 @@ db_path = "mcp_mission.db"
 provider = "openai"
 
 # Model for the selected provider.
-# OpenAI example:    "gpt-6-sol"
+# OpenAI example:    "gpt-6.1-sol"
 # Anthropic example: "claude-sonnet-4-20250514"
-model = "gpt-6-sol"
+model = "gpt-6.1-sol"
 
-# OpenAI requires reasoning_effort.
+# GPT-6.1 Sol defaults to medium and uses Responses for tool calls.
+# This value is sent as reasoning.effort on Responses requests.
 # Anthropic Messages has no reasoning_effort parameter; this setting is ignored.
 # Claude uses separate thinking/output_config.effort controls where supported.
-reasoning_effort = "none"
+reasoning_effort = "medium"
 
 # API key should be set via OPENAI_API_KEY or ANTHROPIC_API_KEY env var
 #

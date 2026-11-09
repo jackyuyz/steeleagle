@@ -151,14 +151,16 @@ async def run_chat(
     logger.info("Generated system prompt with %d actions, %d events", len(_ACTIONS), len(_EVENTS))
 
     client_cfg = config["client"]
-    provider_name = cli_provider or client_cfg.get("provider", "anthropic")
+    configured_provider = client_cfg.get("provider", "openai")
+    provider_name = cli_provider or configured_provider
     base_url = cli_base_url or client_cfg.get("openai_base_url", "")
     provider = _create_provider(
         provider_name, base_url, reasoning_effort=client_cfg.get("reasoning_effort")
     )
 
     api_key = _resolve_api_key(client_cfg, provider_name, cli_api_key)
-    model = cli_model or client_cfg.get("model", provider.default_model)
+    configured_model = client_cfg.get("model") if provider_name == configured_provider else None
+    model = cli_model or configured_model or provider.default_model
 
     server_cmd = ["steeleagle-mcp-server"]
     if config.get("_config_path"):
