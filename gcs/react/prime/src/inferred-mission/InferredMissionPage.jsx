@@ -312,19 +312,9 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     return (
         <section className="im-page" aria-label="Inferred Mission">
             <div className="im-input">
-                <div className="im-input-heading">
-                    <div className="im-source" aria-label="Footage source">
-                        <button type="button" aria-pressed={!videoMode} onClick={() => setSource('live')}>Live observation</button>
-                        <button type="button" aria-pressed={videoMode} onClick={() => setSource('uploaded_video')}>Upload MP4</button>
-                    </div>
-                    <div className="im-actions">
-                        <label>History <select value={historyMode} onChange={event => setHistoryMode(event.target.value)}>
-                            <option value="">Default ({config?.settings.history_mode || 'recency'})</option>
-                            <option value="recency">Recency</option><option value="uniform">Uniform</option>
-                            <option value="no_memory">No memory</option>
-                        </select></label>
-                        <span className="im-badge">Analysis only</span>
-                    </div>
+                <div className="im-source" aria-label="Footage source">
+                    <button type="button" aria-pressed={!videoMode} onClick={() => setSource('live')}>Live observation</button>
+                    <button type="button" aria-pressed={videoMode} onClick={() => setSource('uploaded_video')}>Upload MP4</button>
                 </div>
                 {videoMode ? (
                     <div className="im-upload" onDragOver={event => event.preventDefault()}
@@ -333,25 +323,37 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                             onChange={event => { chooseFile(event.target.files[0]); event.target.value = ''; }} /></label>
                         {progress != null && <p role="status">{progress < 100 ? `Uploading ${progress}%` : 'Checking video…'}</p>}
                         {asset && <p>{asset.name} · {asset.duration.toFixed(1)}s · {Math.ceil(asset.duration / (config?.settings.section_seconds || 15))} sections</p>}
-                        {asset && <label>Takeoff offset in seconds (optional) <input type="number" min="0" max={asset.duration} step="0.1"
-                            value={videoTakeoff} onChange={event => setVideoTakeoff(event.target.value)} /></label>}
                         {config && !config.media_available && <p className="im-note">Install FFmpeg and ffprobe on the GCS backend.</p>}
                     </div>
                 ) : (
                     <div className="im-live-fields">
-                        <label>Feed <select value={feed} onChange={event => { setFeed(event.target.value); setVehicle(''); }}>
+                        <label className="im-feed-field">Feed <select value={feed} onChange={event => { setFeed(event.target.value); setVehicle(''); }}>
                             <option value="local">Local</option><option value="remote">Remote</option>
                         </select></label>
-                        {feed === 'local' ? <label>Vehicle <select value={vehicle} onChange={event => setVehicle(event.target.value)}>
+                        {feed === 'local' ? <label className="im-vehicle-field">Vehicle <select value={vehicle} onChange={event => setVehicle(event.target.value)}>
                             <option value="">Select a vehicle</option>
                             {config?.local_vehicles.map(name => <option key={name}>{name}</option>)}
-                        </select></label> : <label>Vehicle <input value={vehicle} list="im-vehicles" placeholder="Vehicle name"
+                        </select></label> : <label className="im-vehicle-field">Vehicle <input value={vehicle} list="im-vehicles" placeholder="Vehicle name"
                             onChange={event => setVehicle(event.target.value)} />
                             <datalist id="im-vehicles">{vehicles?.map(item => <option key={item.name} value={item.name} />)}</datalist>
                         </label>}
-                        <label>Takeoff time (optional) <input type="datetime-local" value={takeoff} onChange={event => setTakeoff(event.target.value)} /></label>
                     </div>
                 )}
+                <details className="im-advanced">
+                    <summary>Advanced options</summary>
+                    <div className="im-actions im-advanced-fields">
+                        <label>History <select value={historyMode} onChange={event => setHistoryMode(event.target.value)}>
+                            <option value="">Default ({config?.settings.history_mode || 'recency'})</option>
+                            <option value="recency">Recency</option><option value="uniform">Uniform</option>
+                            <option value="no_memory">No memory</option>
+                        </select></label>
+                        {videoMode ? asset && <label>Takeoff offset in seconds (optional) <input type="number" min="0" max={asset.duration} step="0.1"
+                            value={videoTakeoff} onChange={event => setVideoTakeoff(event.target.value)} /></label> :
+                            <label>Takeoff time (optional) <input type="datetime-local" value={takeoff}
+                                aria-describedby="im-takeoff-help" onChange={event => setTakeoff(event.target.value)} /></label>}
+                    </div>
+                    {!videoMode && <p className="im-note" id="im-takeoff-help">Leave blank to start the timeline at the first valid frame after you start observing.</p>}
+                </details>
                 <div className="im-input-footer">
                     {config ? <ModelStages label="New run models" models={config.models} /> : <span>Loading model settings…</span>}
                     <button type="button" className="im-primary" onClick={start}

@@ -11,7 +11,7 @@
 
 .im-page h3, .im-page h4, .im-page p { margin: 0; }
 .im-page p { line-height: 1.5; }
-.im-input-heading, .im-input-footer, .im-run-bar, .im-detail-title, .im-actions, .im-live-fields {
+.im-input-footer, .im-run-bar, .im-detail-title, .im-actions, .im-live-fields {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -28,7 +28,7 @@
     border-radius: 0.65rem;
 }
 .im-input, .im-detail, .im-empty { padding: 1rem; }
-.im-input-heading, .im-live-fields, .im-upload { margin-bottom: 0.9rem; }
+.im-source, .im-live-fields, .im-upload { margin-bottom: 0.9rem; }
 .im-live-fields, .im-actions { justify-content: flex-start; }
 .im-page label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
 .im-page select, .im-page input, .im-page button:not(.p-button) {
@@ -40,6 +40,12 @@
     padding: 0.4rem 0.65rem;
     max-width: 100%;
 }
+.im-live-fields > label { max-width: 100%; }
+.im-feed-field select { width: 8rem; }
+.im-vehicle-field :is(select, input) { width: 18rem; }
+.im-advanced { margin-bottom: 0.9rem; }
+.im-advanced > summary { cursor: pointer; }
+.im-advanced-fields { margin-top: 0.65rem; }
 .im-page button:not(.p-button) { cursor: pointer; }
 .im-page button:not(.p-button):hover:enabled, .im-page button:not(.p-button):focus-visible { border-color: var(--im-accent); }
 .im-page button:not(.p-button):disabled { cursor: default; opacity: 0.55; }
