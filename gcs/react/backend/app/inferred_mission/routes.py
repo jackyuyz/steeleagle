@@ -17,7 +17,7 @@ from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from app.inferred_mission.adapter import analysis_settings, observe_remote, runtime
-from steeleagle_mcp.inferred_mission.config import Settings
+from steeleagle_mcp.inferred_mission.config import SectionMode, Settings
 from steeleagle_mcp.inferred_mission.media import media_available, probe_video
 from steeleagle_mcp.inferred_mission.storage import write_json
 from steeleagle_mcp.inferred_mission.vision import PROMPT_VERSION
@@ -38,6 +38,7 @@ class StartSession(BaseModel):
     history_mode: Literal["recency", "uniform", "no_memory"] | None = None
     flight_started_at: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     video_takeoff_offset: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    section_mode: SectionMode | None = None
 
 
 def _service(request: Request):
@@ -151,6 +152,8 @@ async def start_session(request: Request, body: StartSession):
     settings = _settings()
     if body.history_mode:
         settings = replace(settings, history_mode=body.history_mode)
+    if body.section_mode:
+        settings = replace(settings, section_mode=body.section_mode)
     try:
         configured_runtime, _ = runtime(settings)
     except (ValueError, OSError, TypeError):

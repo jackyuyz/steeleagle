@@ -199,6 +199,7 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     const [takeoff, setTakeoff] = useState('');
     const [videoTakeoff, setVideoTakeoff] = useState('');
     const [historyMode, setHistoryMode] = useState('');
+    const [sectionMode, setSectionMode] = useState('');
     const [asset, setAsset] = useState(null);
     const [progress, setProgress] = useState(null);
     const [busy, setBusy] = useState(false);
@@ -212,7 +213,9 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     const showNewRun = newRunOpen ?? runs.length === 0;
     const active = Boolean(session && ACTIVE.has(session.status));
     const queuedCount = session?.sections?.filter(row => row.status === 'queued').length ?? 0;
-    const index = selectedIndex ?? session?.sections?.findLast(row => row.status !== 'queued')?.index
+    const parallelVideo = session?.source_type === 'uploaded_video' && session.settings?.section_mode === 'sliding';
+    const latestResult = parallelVideo ? session.sections.findLast(row => row.inference_text || row.error) : undefined;
+    const index = selectedIndex ?? latestResult?.index ?? session?.sections?.findLast(row => row.status !== 'queued')?.index
         ?? session?.sections?.at(-1)?.index;
     const summary = session?.sections?.find(row => row.index === index);
     const detailStatus = summary?.status;
@@ -283,6 +286,7 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
         try {
             const body = { source_type: source };
             if (historyMode) body.history_mode = historyMode;
+            if (sectionMode) body.section_mode = sectionMode;
             if (source === 'uploaded_video') {
                 body.video_asset_id = asset.id;
                 if (videoTakeoff !== '') body.video_takeoff_offset = Number(videoTakeoff);
@@ -322,6 +326,11 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     const row = detail?.sessionId === sessionId && detail?.row.index === index ? detail.row : null;
     const frameAge = session?.last_frame_received ? Math.max(0, Math.floor(now - session.last_frame_received)) : null;
     const videoMode = source === 'uploaded_video';
+    const sectionSeconds = config?.settings.section_seconds ?? 15;
+    const sliding = (sectionMode || config?.settings.section_mode) === 'sliding';
+    const videoSections = asset && (sliding
+        ? 1 + Math.ceil(Math.max(0, asset.duration - sectionSeconds))
+        : Math.ceil(asset.duration / sectionSeconds));
     const sourceReady = videoMode ? asset && config?.media_available
         : vehicle && (feed === 'local' || config?.remote_available);
     const canStart = Boolean(!busy && config?.configured && sourceReady);
@@ -378,7 +387,7 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                                     {asset ? <>
                                         <strong>{asset.name}</strong>
                                         <p className="im-muted">
-                                            {asset.duration.toFixed(1)} s · {Math.ceil(asset.duration / (config?.settings.section_seconds || 15))} sections
+                                            {asset.duration.toFixed(1)} s · {videoSections} sections
                                         </p>
                                     </> : progress != null ? (
                                         <p role="status">{progress < 100 ? `Uploading ${progress}%` : 'Checking video…'}</p>
@@ -407,6 +416,11 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                     <details className="im-advanced">
                         <summary>Advanced options</summary>
                         <div className="im-actions im-advanced-fields">
+                            <label>Section window <select value={sectionMode} onChange={event => setSectionMode(event.target.value)}>
+                                <option value="">Default ({config?.settings.section_mode === 'sliding' ? 'Sliding' : 'Non-overlapping'})</option>
+                                <option value="non_overlapping">Non-overlapping</option>
+                                <option value="sliding">{videoMode ? 'Sliding (1-second step, up to 5 in parallel)' : 'Sliding (1-second step)'}</option>
+                            </select></label>
                             <label>History <select value={historyMode} onChange={event => setHistoryMode(event.target.value)}>
                                 <option value="">Default ({config?.settings.history_mode || 'recency'})</option>
                                 <option value="recency">Recency</option><option value="uniform">Uniform</option>

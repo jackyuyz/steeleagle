@@ -25,7 +25,7 @@ Mission:
 """
 
 
-def analysis_app(tmp_path, monkeypatch, *, gate=None):
+def analysis_app(tmp_path, monkeypatch, *, gate=None, section_seconds=1.0):
     prompts = []
 
     async def infer(prompt, frames):
@@ -40,7 +40,7 @@ def analysis_app(tmp_path, monkeypatch, *, gate=None):
         assert wrong["status"] == "task_mismatch"
         assert candidate.dispatch("compile_mission_dsl", {"dsl": DSL})["ok"]
 
-    config = Settings(section_seconds=1.0, max_frame_side=96)
+    config = Settings(section_seconds=section_seconds, max_frame_side=96)
     runtime = Runtime({"vision_model": "mock-vision", "dsl_model": "mock-dsl"}, infer, generate)
     monkeypatch.setattr(routes, "analysis_settings", lambda: config)
     monkeypatch.setattr(routes, "runtime", lambda *_args, **_kwargs: (runtime, True))
@@ -120,6 +120,144 @@ async def test_uploaded_video_pause_resume_and_download(tmp_path, monkeypatch):
         arm = await client.post(f"/api/inferred-mission/sessions/{run_id}/backup/arm")
         assert arm.status_code == 404
         await recovered.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not media_available(), reason="FFmpeg and ffprobe are required for MP4 tests")
+async def test_uploaded_video_sliding_windows_reuse_the_same_frames(tmp_path, monkeypatch):
+    video = tmp_path / "flight.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-n", "-f", "lavfi", "-i", "testsrc2=s=96x64:r=30000/1001:d=6.2",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
+    ], check=True, timeout=15)
+    app, prompts = analysis_app(tmp_path, monkeypatch, section_seconds=5)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            uploaded = await client.post("/api/inferred-mission/videos", files={"file": ("flight.mp4", video.read_bytes())})
+            assert uploaded.status_code == 201, uploaded.text
+            asset = uploaded.json()
+            created = await client.post("/api/inferred-mission/sessions", json={
+                "source_type": "uploaded_video", "video_asset_id": asset["id"], "section_mode": "sliding",
+            })
+            assert created.status_code == 201, created.text
+            assert created.json()["total_sections"] == 3
+            complete = await wait_for(client, created.json()["id"], lambda r: r["status"] == "completed")
+            assert [(r["start"], r["end"]) for r in complete["sections"]] == [(0, 5), (1, 6), (2, asset["duration"])]
+            frames_by_section = {
+                json.loads(prompt.rsplit("\n", 1)[-1])["section"]: [frame.jpeg for frame in frames]
+                for prompt, frames in prompts
+            }
+            first, second, tail = (frames_by_section[index] for index in (1, 2, 3))
+            assert [len(first), len(second), len(tail)] == [5, 5, 5]
+            assert first[1:] == second[:-1]
+            assert second[1:] == tail[:-1]
+    finally:
+        await app.state.inferred_mission.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not media_available(), reason="FFmpeg and ffprobe are required for MP4 tests")
+async def test_sliding_video_concurrency_preserves_recency_and_pause(tmp_path, monkeypatch):
+    video = tmp_path / "flight.mp4"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-n", "-f", "lavfi", "-i", "color=blue:s=96x64:r=8:d=11",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
+    ], check=True, timeout=15)
+    app, _ = analysis_app(tmp_path, monkeypatch, section_seconds=5)
+    service = app.state.inferred_mission
+    started = {}
+    release = {index: asyncio.Event() for index in range(1, 8)}
+    finish_first_dsl = asyncio.Event()
+
+    async def infer(prompt, _frames):
+        context = json.loads(prompt.rsplit("\n", 1)[-1])
+        index = context["section"]
+        assert index not in started
+        started[index] = context["history"]
+        await release[index].wait()
+        return "Wait 10 seconds, then return home." if index == 1 else INSTRUCTION
+
+    async def generate(candidate, _reference):
+        seconds = candidate.task["seconds"]
+        if seconds == 10:
+            await finish_first_dsl.wait()
+        assert candidate.dispatch("compile_mission_dsl", {"dsl": DSL.replace("5.0", f"{seconds}.0")})["ok"]
+
+    runtime = Runtime({}, infer, generate)
+    monkeypatch.setattr(routes, "runtime", lambda *_args, **_kwargs: (runtime, True))
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            uploaded = await client.post("/api/inferred-mission/videos", files={"file": ("flight.mp4", video.read_bytes())})
+            assert uploaded.status_code == 201, uploaded.text
+            created = await client.post("/api/inferred-mission/sessions", json={
+                "source_type": "uploaded_video", "video_asset_id": uploaded.json()["id"], "section_mode": "sliding",
+            })
+            assert created.status_code == 201, created.text
+            run_id = created.json()["id"]
+            endpoint = f"/api/inferred-mission/sessions/{run_id}"
+            await wait_for(client, run_id, lambda _: len(started) >= 5)
+            assert started == dict.fromkeys(range(1, 6), [])
+
+            release[2].set()
+            waiting = await wait_for(client, run_id, lambda r: len(r["sections"]) == 6)
+            assert [row["index"] for row in waiting["sections"]] == list(range(1, 7))
+            assert waiting["sections"][1]["status"] == "completed"
+            assert waiting["sections"][5]["status"] == "preparing"
+            assert 6 not in started
+
+            release[1].set()
+            overlap = await wait_for(client, run_id, lambda _: 6 in started)
+            assert overlap["sections"][0]["status"] == "generating"
+            assert [(item["section"], item["weight"]) for item in started[6]] == [(1, 1.0)]
+
+            paused = await client.post(f"{endpoint}/pause")
+            assert paused.json()["status"] == "pausing"
+            for gate in release.values():
+                gate.set()
+            finish_first_dsl.set()
+            snapshot = await wait_for(client, run_id, lambda r: r["status"] == "paused")
+            assert [row["status"] for row in snapshot["sections"]] == ["completed"] * 6
+            assert 7 not in started
+
+            resumed = await client.post(f"{endpoint}/resume")
+            assert resumed.status_code == 200, resumed.text
+            complete = await wait_for(client, run_id, lambda r: r["status"] == "completed")
+            assert [row["status"] for row in complete["sections"]] == ["completed"] * 7
+            assert [item["section"] for item in started[7]] == [1, 2]
+            assert started[7][0]["weight"] < started[7][1]["weight"] == 1.0
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_live_sliding_windows_advance_on_each_new_second(tmp_path, monkeypatch):
+    from io import BytesIO
+
+    from PIL import Image
+
+    app, prompts = analysis_app(tmp_path, monkeypatch, section_seconds=5)
+    service = app.state.inferred_mission
+    image = BytesIO()
+    Image.new("RGB", (32, 32), "blue").save(image, "JPEG")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/api/inferred-mission/sessions", json={
+            "source_type": "live", "vehicle_id": "test-drone", "section_mode": "sliding",
+        })
+        assert created.status_code == 201, created.text
+        run_id = created.json()["id"]
+        stamp = time.time() - 4.5
+        try:
+            for i in range(6):
+                service.ingest("test-drone", "local", stamp + i, image.getvalue(), frame_id=i + 1)
+                if i == 4:
+                    assert len(service.runs[run_id].records) == 1
+            await client.post(f"/api/inferred-mission/sessions/{run_id}/stop")
+            stopped = await wait_for(client, run_id, lambda r: r["status"] == "stopped")
+            assert [(r["start"], r["end"]) for r in stopped["sections"]] == [(0, 5), (1, 6)]
+            assert [[frame.frame_id for frame in frames] for _, frames in prompts] == [[1, 2, 3, 4, 5], [2, 3, 4, 5, 6]]
+            assert [[frame.time for frame in frames] for _, frames in prompts] == [[0, 1, 2, 3, 4]] * 2
+        finally:
+            await service.close()
 
 
 @pytest.mark.asyncio

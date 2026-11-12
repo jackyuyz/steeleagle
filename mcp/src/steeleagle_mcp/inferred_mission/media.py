@@ -54,8 +54,13 @@ def sample_section(path: Path, start: float, end: float, directory: Path,
     directory.mkdir(parents=True, exist_ok=False)
     duration = end - start
     side = settings.max_frame_side
+    if settings.section_mode == "sliding":
+        # Compare sampling slots so a late frame does not shift later samples.
+        select = f"isnan(prev_selected_t)+gt(floor(t*{settings.frame_fps:.9f}+1e-6)\\,floor(prev_selected_t*{settings.frame_fps:.9f}+1e-6))"
+    else:
+        select = f"isnan(prev_selected_t)+gte(t-prev_selected_t\\,{1/settings.frame_fps:.9f})"
     filters = (
-        f"trim=duration={duration:.9f},select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,{1/settings.frame_fps:.9f}),"
+        f"trim=duration={duration:.9f},select={select},"
         f"scale={side}:{side}:force_original_aspect_ratio=decrease,showinfo"
     )
     result = _run([

@@ -4,10 +4,12 @@ import math
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from steeleagle_mcp.config import DEFAULT_OPENAI_MODEL
 
 HISTORY_MODES = ("recency", "uniform", "no_memory")
+SectionMode = Literal["non_overlapping", "sliding"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,16 @@ class Settings:
     max_video_bytes: int = 1024**3
     max_video_seconds: float = 3600.0
     max_active_runs: int = 4
+    section_mode: SectionMode = "non_overlapping"
+
+    @property
+    def section_stride(self) -> float:
+        return 1.0 if self.section_mode == "sliding" else self.section_seconds
+
+    def section_count(self, duration: float) -> int:
+        if self.section_mode == "non_overlapping":
+            return math.ceil(duration / self.section_seconds)
+        return 1 + math.ceil(max(0, duration - self.section_seconds) / self.section_stride)
 
     def __post_init__(self):
         positive = (
@@ -35,6 +47,8 @@ class Settings:
             raise ValueError("Inference durations and sampling rates must be finite and positive.")
         if self.section_seconds < 1 or not 1 <= self.section_seconds * self.frame_fps <= 60:
             raise ValueError("A section must be at least 1 second and sample between 1 and 60 frames.")
+        if self.section_mode not in ("non_overlapping", "sliding"):
+            raise ValueError("Choose a supported section mode.")
         if not 32 <= self.max_frame_side <= 1536 or not 0 <= self.history_sections <= 30:
             raise ValueError("Inference image size or history window is out of range.")
         if self.max_video_bytes < 1 or not 1 <= self.max_active_runs <= 16:

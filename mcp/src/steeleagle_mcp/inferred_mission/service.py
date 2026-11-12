@@ -9,7 +9,8 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass, field
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from .config import Settings
@@ -20,6 +21,7 @@ from .vision import PROMPT_VERSION, FrameSample, build_prompt, load_prompt, pars
 
 logger = logging.getLogger(__name__)
 _FINAL = {"completed", "failed", "skipped", "gap"}
+_SLIDING_VIDEO_CONCURRENCY = 5
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,7 @@ class AnalysisService:
         self.root = root.resolve()
         self.runs: dict[str, Run] = {}
         self.live: dict[tuple[str, str], Run] = {}
+        self._sliding_video_slots = asyncio.Semaphore(_SLIDING_VIDEO_CONCURRENCY)
 
     def recover(self) -> None:
         for path in (self.root / "runs").glob("*/session.json"):
@@ -156,7 +159,7 @@ class AnalysisService:
         if takeoff_offset is not None and takeoff_offset >= video["duration"]:
             raise ValueError("The takeoff offset must be within the video.")
         run = self._new(settings, runtime, source_type="uploaded_video", video=video, status="analyzing",
-                        total_sections=math.ceil(video["duration"] / settings.section_seconds),
+                        total_sections=settings.section_count(video["duration"]),
                         time_basis="video", video_takeoff_offset=takeoff_offset)
         run.task = asyncio.create_task(self._run_video(run, settings, runtime))
         return run
@@ -203,16 +206,7 @@ class AnalysisService:
             if not path.is_file() or await asyncio.to_thread(source_digest) != video["sha256"]:
                 run.save(status="error", error="The uploaded video has changed or is missing. Upload the original again.")
                 return
-            for index in range(1, run.metadata["total_sections"] + 1):
-                if run.metadata["status"] != "analyzing":
-                    break
-                if run.records.get(index, {}).get("status") in _FINAL:
-                    continue
-                start = (index - 1) * settings.section_seconds
-                end = min(index * settings.section_seconds, video["duration"])
-                record = {"index": index, "start": start, "end": end,
-                          "input_quality": "partial" if end - start < settings.section_seconds else "complete"}
-                await self._process(run, record, settings, runtime, video_path=path)
+            await self._process_video_sections(run, settings, runtime, path)
             status = run.metadata["status"]
             run.save(status={"pausing": "paused", "stopping": "stopped"}.get(status, "completed"))
         except asyncio.CancelledError:
@@ -221,6 +215,43 @@ class AnalysisService:
         except Exception:
             logger.exception("Video analysis worker failed")
             run.save(status="paused", error="Analysis was interrupted. Check GCS logs and resume.")
+
+    async def _process_video_sections(self, run: Run, settings: Settings, runtime: Runtime, path: Path) -> None:
+        sliding = settings.section_mode == "sliding"
+        limit = _SLIDING_VIDEO_CONCURRENCY if sliding else 1
+        use_history = settings.history_mode != "no_memory" and settings.history_sections > 0
+        duration = run.metadata["video"]["duration"]
+        active: dict[asyncio.Task, tuple[float, asyncio.Event]] = {}
+
+        async def process(record: dict, history_ready: tuple[asyncio.Event, ...], vision_ready: asyncio.Event) -> None:
+            async with self._sliding_video_slots if sliding else nullcontext():
+                if run.metadata["status"] == "analyzing":
+                    await self._process(run, record, settings, runtime, video_path=path,
+                                        history_ready=history_ready, vision_ready=vision_ready)
+                else:
+                    vision_ready.set()
+
+        async with asyncio.TaskGroup() as group:
+            for index in range(1, run.metadata["total_sections"] + 1):
+                if len(active) == limit:
+                    done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:
+                        del active[task]
+                if run.metadata["status"] != "analyzing":
+                    break
+                if run.records.get(index, {}).get("status") in _FINAL:
+                    continue
+                start = (index - 1) * settings.section_stride
+                end = min(start + settings.section_seconds, duration)
+                record = {"index": index, "start": start, "end": end,
+                          "input_quality": "partial" if end - start < settings.section_seconds else "complete"}
+                # Only earlier windows that could enter select_history can delay this prompt.
+                history_ready = tuple(
+                    ready for previous_end, ready in active.values() if use_history and previous_end <= start
+                )
+                vision_ready = asyncio.Event()
+                task = group.create_task(process(record, history_ready, vision_ready))
+                active[task] = (end, vision_ready)
 
     def start_live(self, vehicle: str, feed: str, settings: Settings, runtime: Runtime,
                    flight_started_at: float | None = None) -> Run:
@@ -257,7 +288,11 @@ class AnalysisService:
             run.save(observation_started_at=frame_time)
         duration = run.metadata["settings"]["section_seconds"]
         elapsed = frame_time - run.anchor
+        sliding = run.metadata["settings"].get("section_mode") == "sliding"
+        stride = 1.0 if sliding else duration
         index = math.floor(elapsed / duration) + 1
+        if sliding:
+            index = max(0, math.floor((elapsed - duration) / stride) + 1) + 1
         if index > run.index:
             try:
                 self._queue_live(run)
@@ -265,11 +300,11 @@ class AnalysisService:
                 run.source_notice = "Could not save the section. Check GCS storage."
                 return
             if index > run.index + 1:
-                start = run.index * duration + self._offset(run)
-                end = (index - 1) * duration + self._offset(run)
+                start = run.index * stride + self._offset(run)
+                end = (index - 2) * stride + duration + self._offset(run)
                 run.record({"index": run.index + 1, "start": start, "end": end, "status": "gap",
                             "error": "No fresh frames were received in this interval."})
-            run.index = index
+            self._advance_live(run, index, stride)
         run.last_frame_time = frame_time
         run.last_received = received_at if received_at is not None else now
         run.section_uses_receive_time |= captured_at is None
@@ -277,11 +312,33 @@ class AnalysisService:
             "Receiving local imagery using GCS receipt time."
             if captured_at is None else "Receiving timestamped imagery."
         )
-        relative = elapsed - (index - 1) * duration
+        window_start = (run.index - 1) * stride
+        relative = elapsed - window_start
         interval = 1 / run.metadata["settings"]["frame_fps"]
-        if not run.frames or relative - run.frames[-1].time >= interval - 1e-6:
+        if sliding:
+            # Use the same observation-relative sampling grid for every overlapping window.
+            slot = math.floor((elapsed + 1e-6) / interval)
+            last_slot = math.floor((run.frames[-1].time + window_start + 1e-6) / interval) if run.frames else -1
+            sample = slot > last_slot
+        else:
+            sample = not run.frames or relative - run.frames[-1].time >= interval - 1e-6
+        if sample:
             run.frames.append(FrameSample(relative, jpeg, captured_at, frame_id))
             run.telemetry = telemetry
+            if sliding and relative + interval >= duration:
+                try:
+                    self._queue_live(run)
+                except OSError:
+                    run.source_notice = "Could not save the section. Check GCS storage."
+                    return
+                self._advance_live(run, run.index + 1, stride)
+
+    @staticmethod
+    def _advance_live(run: Run, index: int, stride: float) -> None:
+        shift = (index - run.index) * stride
+        run.frames = [replace(frame, time=frame.time - shift) for frame in run.frames if frame.time >= shift]
+        run.section_uses_receive_time = any(frame.capture_time is None for frame in run.frames)
+        run.index = index
 
     @staticmethod
     def _offset(run: Run) -> float:
@@ -292,8 +349,14 @@ class AnalysisService:
         if not run.frames:
             return
         duration = run.metadata["settings"]["section_seconds"]
-        start = (run.index - 1) * duration + self._offset(run)
-        observed = max(run.last_frame_time - run.anchor - (run.index - 1) * duration, 0.001)
+        sliding = run.metadata["settings"].get("section_mode") == "sliding"
+        stride = 1.0 if sliding else duration
+        # Reused frames alone do not constitute a new window after a feed stalls or stops.
+        if sliding and run.index > 1 and run.frames[-1].time < duration - stride:
+            return
+        window_start = (run.index - 1) * stride
+        start = window_start + self._offset(run)
+        observed = max(run.last_frame_time - run.anchor - window_start, 0.001)
         end = start + (min(duration, observed + 0.001) if partial else duration)
         quality = "partial" if partial or len(run.frames) < math.ceil(duration * run.metadata["settings"]["frame_fps"] / 2) else "complete"
         directory = run.section_dir(run.index) / "frames"
@@ -304,7 +367,7 @@ class AnalysisService:
             path.write_bytes(frame.jpeg)
             files.append(str(path.relative_to(run.directory)))
         record = {"index": run.index, "start": start, "end": end, "status": "queued", "telemetry": run.telemetry,
-                  "capture_start": None if run.section_uses_receive_time else run.anchor + (run.index - 1) * duration,
+                  "capture_start": None if run.section_uses_receive_time else run.anchor + window_start,
                   "capture_end": None if run.section_uses_receive_time else run.last_frame_time,
                   "uses_gcs_receive_time": run.section_uses_receive_time,
                   "frame_files": files, "frame_count": len(files),
@@ -314,8 +377,9 @@ class AnalysisService:
                   "input_quality": quality}
         run.record(record)
         run.pending.append(run.index)
-        run.frames = []
-        run.section_uses_receive_time = False
+        if not sliding:
+            run.frames = []
+            run.section_uses_receive_time = False
         run.wake.set()
 
     async def _run_live(self, run: Run, key: tuple[str, str], settings: Settings, runtime: Runtime) -> None:
@@ -342,7 +406,8 @@ class AnalysisService:
             run.save(status=status, error=error)
 
     async def _process(self, run: Run, record: dict, settings: Settings, runtime: Runtime,
-                       *, video_path: Path | None = None) -> None:
+                       *, video_path: Path | None = None, history_ready: tuple[asyncio.Event, ...] = (),
+                       vision_ready: asyncio.Event | None = None) -> None:
         started = time.monotonic()
         index = record["index"]
         archived = run.records.get(index, {})
@@ -366,6 +431,8 @@ class AnalysisService:
                 frames = await asyncio.to_thread(_prepare_live_frames, paths, record, settings.max_frame_side)
             if not frames:
                 raise ValueError("No decodable frames in this section.")
+            for ready in history_ready:
+                await ready.wait()
             records = sorted(run.records.values(), key=lambda row: row["index"])
             history = select_history(records, record["start"], settings)
             base = (run.directory / "prompt.md").read_text(encoding="utf-8")
@@ -398,6 +465,8 @@ class AnalysisService:
                           unresolved=unresolved, context_status="unresolved" if unresolved else "unverified",
                           inference_elapsed=round(time.monotonic() - started, 3))
             run.record(record)
+            if vision_ready is not None:
+                vision_ready.set()
             generation = Generation(instruction, task, area=None)
             generation_started = time.monotonic()
             reference = await asyncio.to_thread(generation.reference)
@@ -436,3 +505,5 @@ class AnalysisService:
                 record["inference_status"] = "invalid" if "inference_text" in record else "failed"
             record["elapsed"] = round(time.monotonic() - started, 3)
             run.record(record)
+            if vision_ready is not None:
+                vision_ready.set()
