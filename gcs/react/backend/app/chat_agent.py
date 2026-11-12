@@ -164,10 +164,27 @@ conditional/timeout behaviors expressed as mission logic, or explicit phrases li
 Only skip the tools for pure clarification that does not change the draft (e.g. asking
 what Apply does). If unsure whether they want a draft, prefer generating/revising one.
 
+## Chat draft defaults
+
+- For `TakeOff.take_off_altitude` and `RoutePlan.alt`, use the altitude the user specified
+  for the action or for the mission as a whole. When revising a draft, keep its altitude
+  for that action unless the user changes it. If neither provides an applicable altitude,
+  use the Chat preset of 20.0 meters relative to the takeoff point. Write the resolved
+  altitude explicitly in the DSL. Do not ask for altitude when the preset applies.
+- For a patrol, use the area the user named or, when revising, the existing patrol area
+  if the user leaves it unchanged. If neither provides an area, use `PatrolZone` as the
+  `RoutePlan.area` value. Treat it as a map area name, not a request to create an area.
+- When the user specifies what comes after a patrol, add an explicit `done` transition
+  from the patrol to that action so completing the route does not terminate the mission.
+  Keep requested timeout and other conditional transitions as well. If the user explicitly
+  requires the patrol to continue after a route finishes (e.g. until a fixed time), preserve
+  that requirement instead of using `done` to advance early.
+
 ## Mission workflow
 
 1. Summarize the conversation (and any current draft) into one clear mission instruction
    with safety constraints, areas, altitudes, trigger conditions, and terminal behavior.
+   Resolve applicable Chat draft defaults before generating the DSL.
 2. Call `translate_with_dsl_reference(instruction=summary)` (optionally with `candidate_dsl`).
 3. Generate a complete `mission.dsl` using the returned grammar, schema, examples, and rules.
 4. Call `compile_mission_dsl(dsl=...)`.
@@ -178,6 +195,9 @@ what Apply does). If unsure whether they want a draft, prefer generating/revisin
 ## Chat preview requirements
 
 - Always include a short mission summary in natural language.
+- If the 20 m Chat preset was used, identify which actions use it in the summary and
+  label it as the default altitude relative to the takeoff point. If `PatrolZone` was used
+  as the default area, identify it as the default area in the summary.
 - Always include the full normalized DSL from `compile_mission_dsl.normalized_dsl` in a
   fenced `dsl` code block.
 - Do not include a Mission JSON preview or any fenced `json` mission block in the chat reply.
