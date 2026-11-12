@@ -150,8 +150,26 @@
 .im-fold > summary { cursor: pointer; font-weight: 600; }
 .im-artifacts { display: flex; flex-direction: column; }
 .im-artifact-toolbar { margin-bottom: 0.6rem; }
-.im-artifact-tabs .p-tabview-nav { flex-wrap: wrap; }
-.im-artifact-tabs .p-tabview-nav-link { padding: 0.65rem 0.8rem; font-size: 0.9rem; }
+.im-artifact-tabs .p-tabview-nav {
+    flex-wrap: wrap;
+    border: 0;
+    box-shadow: inset 0 -1px 0 var(--im-line);
+}
+.im-artifact-tabs .p-tabview-nav-link {
+    margin: 0;
+    padding: 0.65rem 0.8rem;
+    border: 0;
+    background: transparent;
+    font-size: 0.9rem;
+}
+.im-artifact-tabs .p-tabview-nav-link[aria-selected='true']::after {
+    content: '';
+    position: absolute;
+    inset: auto 0 0;
+    height: 2px;
+    background: var(--im-accent);
+    pointer-events: none;
+}
 .im-artifact-tabs .p-tabview-panel > :first-child { margin-top: 0.65rem; }
 .im-artifact-tabs .im-models { margin-bottom: 0.6rem; }
 .im-artifact-actions { margin-top: auto; padding-top: 0.65rem; }

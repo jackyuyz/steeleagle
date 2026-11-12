@@ -430,13 +430,15 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
             </div>
             {error && <p role="alert" className="im-error">{error}</p>}
             {session && <>
-                <p className="im-run-summary" role="status">
-                    {session.video_takeoff_offset != null ? 'Time relative to supplied takeoff offset' :
-                        session.video ? 'Video time' : session.time_basis === 'takeoff' ? 'Time since takeoff' : 'Time since observation began'}
-                    {active && session.source_type === 'live' && ` · ${session.source_notice}`}
-                    {active && session.collecting_section != null && ` Section ${session.collecting_section} collecting (${session.collecting_frames} frames).`}
-                    {active && frameAge != null && ` Last frame ${frameAge}s ago${frameAge > 5 ? ' (stale)' : ''}.`}
-                </p>
+                {(!session.video || session.video_takeoff_offset != null) && (
+                    <p className="im-run-summary" role="status">
+                        {session.video_takeoff_offset != null ? 'Time relative to supplied takeoff offset' :
+                            session.time_basis === 'takeoff' ? 'Time since takeoff' : 'Time since observation began'}
+                        {active && session.source_type === 'live' && ` · ${session.source_notice}`}
+                        {active && session.collecting_section != null && ` Section ${session.collecting_section} collecting (${session.collecting_frames} frames).`}
+                        {active && frameAge != null && ` Last frame ${frameAge}s ago${frameAge > 5 ? ' (stale)' : ''}.`}
+                    </p>
+                )}
                 {session.error && <p className="im-note">{session.error}</p>}
                 <div className="im-report">
                     <aside className="im-timeline" aria-label="Section timeline">
