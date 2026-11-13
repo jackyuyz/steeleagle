@@ -49,9 +49,10 @@ class Run:
     source_notice: str = "Waiting for timestamped imagery."
 
     def save(self, **changes) -> None:
-        self.metadata.update(changes)
-        self.metadata["revision"] += 1
-        write_json(self.directory / "session.json", self.metadata)
+        metadata = {**self.metadata, "updated_at": time.time(), **changes}
+        metadata["revision"] += 1
+        write_json(self.directory / "session.json", metadata)
+        self.metadata = metadata
 
     def record(self, record: dict) -> None:
         write_json(self.section_dir(record["index"]) / "record.json", record)
@@ -66,6 +67,7 @@ class Run:
         for row in sorted(self.records.values(), key=lambda item: item["index"]):
             sections.append({key: row.get(key) for key in (
                 "index", "start", "end", "status", "inference_status", "compile_status", "inference_text", "error",
+                "inference_elapsed", "elapsed",
             )})
         return {**self.metadata, "sections": sections, "last_frame_received": self.last_received,
                 "collecting_section": self.index if self.frames else None,
@@ -105,6 +107,8 @@ class AnalysisService:
                 metadata = read_json(path)
                 if not valid_id(path.parent.name) or metadata.get("id") != path.parent.name:
                     continue
+                metadata.setdefault("updated_at", path.stat().st_mtime)
+                last_updated = metadata["updated_at"]
                 run = Run(path.parent, metadata)
                 for record in sorted((run.directory / "sections").glob("*/record.json")):
                     row = read_json(record)
@@ -116,7 +120,8 @@ class AnalysisService:
                         if row["status"] not in _FINAL:
                             row.update(status="failed" if live else "interrupted", error="Analysis was interrupted.")
                             run.record(row)
-                    run.save(status="stopped" if live else "paused", error="GCS restarted during analysis.")
+                    run.save(status="stopped" if live else "paused", updated_at=last_updated,
+                             error="GCS restarted during analysis.")
             except (OSError, ValueError, KeyError, TypeError):
                 logger.warning("Could not recover inferred mission run %s", path.parent.name)
 
@@ -165,6 +170,8 @@ class AnalysisService:
         return run
 
     def resume(self, run: Run, runtime: Runtime) -> None:
+        if run.metadata.get("archived_at") is not None:
+            raise ValueError("Restore this analysis before resuming.")
         if run.metadata["source_type"] != "uploaded_video" or run.metadata["status"] != "paused":
             raise ValueError("Only a paused video analysis can be resumed.")
         if run.task and not run.task.done():
@@ -180,6 +187,17 @@ class AnalysisService:
             raise ValueError("The archived prompt has changed. Start a new analysis.")
         run.save(status="analyzing", error=None)
         run.task = asyncio.create_task(self._run_video(run, settings, runtime))
+
+    def update_run(self, run: Run, *, display_name: str | None = None, archived: bool | None = None) -> None:
+        changes = {}
+        if display_name is not None:
+            changes["display_name"] = display_name
+        if archived is not None and archived != (run.metadata.get("archived_at") is not None):
+            if archived and run.task and not run.task.done():
+                raise ValueError("Pause or stop this analysis before archiving it.")
+            changes["archived_at"] = time.time() if archived else None
+        if changes:
+            run.save(updated_at=run.metadata["updated_at"], **changes)
 
     def pause(self, run: Run) -> None:
         if run.metadata["source_type"] != "uploaded_video" or run.metadata["status"] != "analyzing":
@@ -423,16 +441,20 @@ class AnalysisService:
         run.record(record)
         generation = None
         try:
+            frame_preparation_started = time.monotonic()
             if video_path:
                 directory = run.section_dir(index) / f"frames-{uuid.uuid4().hex}"
                 frames, paths = await asyncio.to_thread(sample_section, video_path, record["start"], record["end"], directory, settings)
             else:
                 paths = [run.directory / name for name in record["frame_files"]]
                 frames = await asyncio.to_thread(_prepare_live_frames, paths, record, settings.max_frame_side)
+            record["frame_preparation_elapsed"] = round(time.monotonic() - frame_preparation_started, 3)
             if not frames:
                 raise ValueError("No decodable frames in this section.")
+            history_wait_started = time.monotonic()
             for ready in history_ready:
                 await ready.wait()
+            record["history_wait_elapsed"] = round(time.monotonic() - history_wait_started, 3)
             records = sorted(run.records.values(), key=lambda row: row["index"])
             history = select_history(records, record["start"], settings)
             base = (run.directory / "prompt.md").read_text(encoding="utf-8")
@@ -444,8 +466,12 @@ class AnalysisService:
                           frame_files=[str(path.relative_to(run.directory)) for path in paths],
                           frame_count=len(frames), input_quality="sparse" if len(frames) == 1 else record["input_quality"])
             run.record(record)
-            async with asyncio.timeout(settings.request_timeout):
-                text = await runtime.infer(prompt, frames)
+            vision_started = time.monotonic()
+            try:
+                async with asyncio.timeout(settings.request_timeout):
+                    text = await runtime.infer(prompt, frames)
+            finally:
+                record["vision_request_elapsed"] = round(time.monotonic() - vision_started, 3)
             record["inference_text"] = text
             task = parse_instruction(text)
             instruction = " ".join(text.split())

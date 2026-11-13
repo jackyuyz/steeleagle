@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -39,6 +43,13 @@ class StartSession(BaseModel):
     flight_started_at: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     video_takeoff_offset: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     section_mode: SectionMode | None = None
+
+
+class UpdateSession(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    archived: bool | None = None
 
 
 def _service(request: Request):
@@ -189,14 +200,24 @@ async def start_session(request: Request, body: StartSession):
 
 
 @router.get("/sessions")
-async def sessions(request: Request):
+async def sessions(request: Request, include_archived: bool = False):
     runs = sorted(_service(request).runs.values(), key=lambda item: item.metadata["created_at"], reverse=True)
-    return [run.metadata for run in runs]
+    return [run.metadata for run in runs if include_archived or run.metadata.get("archived_at") is None]
 
 
 @router.get("/sessions/{session_id}")
 async def session(request: Request, session_id: str):
     return _run(request, session_id).snapshot()
+
+
+@router.patch("/sessions/{session_id}")
+async def update_session(request: Request, session_id: str, body: UpdateSession):
+    run = _run(request, session_id)
+    try:
+        _service(request).update_run(run, display_name=body.display_name, archived=body.archived)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return run.metadata
 
 
 @router.post("/sessions/{session_id}/pause")
@@ -285,7 +306,7 @@ async def frame(request: Request, session_id: str, index: int, frame_index: int)
 @router.get("/sessions/{session_id}/sections/{index}/files/{filename}")
 async def download(request: Request, session_id: str, index: int,
                    filename: Literal["mission.dsl", "mission.json", "inference.json"]):
-    _, row = _section(request, session_id, index)
+    run, row = _section(request, session_id, index)
     if filename == "mission.dsl":
         value, media_type = row.get("dsl"), "text/plain"
     elif filename == "mission.json":
@@ -296,6 +317,17 @@ async def download(request: Request, session_id: str, index: int,
     if value is None:
         raise HTTPException(404, "This section has no such artifact.")
     content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2) + "\n"
-    return Response(content, media_type=media_type, headers={
-        "Content-Disposition": f'attachment; filename="section-{index:06d}-{filename}"',
-    })
+    if filename == "mission.dsl":
+        disposition = f'attachment; filename="section-{index:06d}-{filename}"'
+    else:
+        metadata = run.metadata
+        source = Path((metadata.get("video") or {}).get("name", "")).stem or metadata.get("vehicle_id", "")
+        name = re.sub(r"[^\w.-]+", "-", metadata.get("display_name") or source)
+        name = name.encode("utf-8")[:180].decode("utf-8", "ignore").strip(".-_") or "analysis-run"
+        fallback = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().strip(".-_") or "analysis-run"
+        timestamp = datetime.fromtimestamp(metadata["created_at"], UTC).strftime("%Y%m%dT%H%M%S.%f")[:-3] + "Z"
+        suffix = f"_{timestamp}_section-{index:06d}_{filename}"
+        disposition = f'attachment; filename="{fallback}{suffix}"'
+        if name != fallback:
+            disposition += f"; filename*=UTF-8''{quote(name + suffix)}"
+    return Response(content, media_type=media_type, headers={"Content-Disposition": disposition})

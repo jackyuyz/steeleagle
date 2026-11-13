@@ -1,11 +1,16 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { Button } from 'primereact/button';
+import { Dialog } from 'primereact/dialog';
 import { Menu } from 'primereact/menu';
 import { TabPanel, TabView } from 'primereact/tabview';
 import './inferredMission.css';
 
 const API = '/api/inferred-mission';
 const ACTIVE = new Set(['observing', 'analyzing', 'pausing', 'stopping']);
+
+function runName(run) {
+    return run.display_name || (run.video ? `Video · ${run.video.name}` : `Live · ${run.vehicle_id}`);
+}
 
 function label(value) {
     return (value || 'pending').replaceAll('_', ' ');
@@ -18,6 +23,24 @@ function timestamp(seconds) {
     const duration = Number.isInteger(remainder)
         ? String(remainder).padStart(2, '0') : remainder.toFixed(2).padStart(5, '0');
     return `${seconds < 0 ? '−' : ''}${minutes}:${duration}`;
+}
+
+function durationLabel(seconds) {
+    if (!Number.isFinite(seconds)) return '—';
+    return seconds >= 60 ? timestamp(seconds) : `${seconds.toFixed(2)} s`;
+}
+
+function TimingMetrics({ label, metrics }) {
+    return (
+        <dl className="im-timing" aria-label={label}>
+            {metrics.map(([name, seconds, description]) => (
+                <div key={name} title={description}>
+                    <dt>{name}</dt>
+                    <dd>{durationLabel(seconds)}</dd>
+                </div>
+            ))}
+        </dl>
+    );
 }
 
 async function jsonRequest(path, options) {
@@ -113,6 +136,14 @@ function SectionDetail({ row, session, onApply }) {
                 {row.error && <p role="alert" className="im-error">{row.error}</p>}
                 {row.unresolved?.map(message => <p key={message} className="im-note">{message}</p>)}
             </div>
+            <TimingMetrics label="Section timing" metrics={[
+                ['Vision ready', row.inference_elapsed, 'From section processing start to a validated visual inference'],
+                ['DSL ready', row.dsl ? row.elapsed : null, 'From section processing start to compiled DSL'],
+                ['Frame prep', row.frame_preparation_elapsed],
+                ['History wait', row.history_wait_elapsed],
+                ['Vision request', row.vision_request_elapsed, 'Time spent calling the vision model'],
+                ['DSL generation', row.generation_elapsed, 'Includes preparing the DSL reference and compiling the result'],
+            ]} />
             <div className="im-detail-grid">
                 <div className="im-evidence">
                     {mediaUrl && <video ref={videoRef} className="im-media" src={mediaUrl} controls preload="metadata"
@@ -170,7 +201,6 @@ function SectionDetail({ row, session, onApply }) {
                                     <pre><code>{attempt.normalized_dsl}</code></pre>
                                 </details>
                             ))}
-                            {row.elapsed != null && <p>Total {row.elapsed}s · inference {row.inference_elapsed ?? '—'}s · generation {row.generation_elapsed ?? '—'}s</p>}
                             {row.telemetry && <pre>{JSON.stringify(row.telemetry, null, 2)}</pre>}
                             {row.vision_prompt && <details><summary>Vision prompt</summary><pre>{row.vision_prompt}</pre></details>}
                             {row.dsl_reference && <details><summary>DSL reference</summary><pre>{JSON.stringify(row.dsl_reference, null, 2)}</pre></details>}
@@ -190,6 +220,8 @@ function SectionDetail({ row, session, onApply }) {
 export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     const [config, setConfig] = useState(null);
     const [runs, setRuns] = useState([]);
+    const [showArchived, setShowArchived] = useState(false);
+    const [renameValue, setRenameValue] = useState(null);
     const [newRunOpen, setNewRunOpen] = useState(null);
     const newRunPanelId = useId();
     const videoInput = useRef(null);
@@ -210,9 +242,18 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     const [detail, setDetail] = useState(null);
     const [now, setNow] = useState(() => Date.now() / 1000);
     const session = snapshot?.id === sessionId ? snapshot : null;
-    const showNewRun = newRunOpen ?? runs.length === 0;
+    const visibleRuns = runs.filter(run => Boolean(run.archived_at) === showArchived);
+    const showNewRun = newRunOpen ?? (!showArchived && visibleRuns.length === 0);
     const active = Boolean(session && ACTIVE.has(session.status));
     const queuedCount = session?.sections?.filter(row => row.status === 'queued').length ?? 0;
+    const visionReady = session?.sections.filter(row => Number.isFinite(row.inference_elapsed)) ?? [];
+    const averageVision = visionReady.length
+        ? visionReady.reduce((total, row) => total + row.inference_elapsed, 0) / visionReady.length : null;
+    const completed = session?.sections.filter(row => row.status === 'completed' && Number.isFinite(row.elapsed)) ?? [];
+    const averageSection = completed.length
+        ? completed.reduce((total, row) => total + row.elapsed, 0) / completed.length : null;
+    const lastUpdate = session?.updated_at ?? session?.created_at;
+    const runElapsed = session ? Math.max(0, (active ? Math.max(now, lastUpdate) : lastUpdate) - session.created_at) : null;
     const parallelVideo = session?.source_type === 'uploaded_video' && session.settings?.section_mode === 'sliding';
     const latestResult = parallelVideo ? session.sections.findLast(row => row.inference_text || row.error) : undefined;
     const index = selectedIndex ?? latestResult?.index ?? session?.sections?.findLast(row => row.status !== 'queued')?.index
@@ -223,12 +264,12 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
     useEffect(() => {
         const controller = new AbortController();
         const options = { signal: controller.signal };
-        Promise.all([jsonRequest(`${API}/status`, options), jsonRequest(`${API}/sessions`, options)])
+        Promise.all([jsonRequest(`${API}/status`, options), jsonRequest(`${API}/sessions?include_archived=true`, options)])
             .then(([settings, saved]) => {
                 setConfig(settings);
                 setRuns(saved);
                 if (!settings.local_vehicles.length && settings.remote_available) setFeed('remote');
-                if (saved.length) setSessionId(saved[0].id);
+                setSessionId(saved.find(run => !run.archived_at)?.id || '');
             }).catch(failure => { if (!controller.signal.aborted) setError(failure.message); });
         return () => controller.abort();
     }, []);
@@ -323,6 +364,36 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
         }
     }
 
+    function switchArchiveView() {
+        const next = !showArchived;
+        setShowArchived(next);
+        setSessionId(runs.find(run => Boolean(run.archived_at) === next)?.id || '');
+        setSelectedIndex(null);
+        setNewRunOpen(false);
+    }
+
+    async function updateRun(changes) {
+        setBusy(true);
+        setError('');
+        try {
+            const updated = await jsonRequest(`${API}/sessions/${sessionId}`, {
+                method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(changes),
+            });
+            setRuns(previous => previous.map(run => run.id === updated.id ? updated : run));
+            setSnapshot(previous => previous?.id === updated.id ? { ...previous, ...updated } : previous);
+            setRenameValue(null);
+            if (changes.archived !== undefined) {
+                setSessionId(visibleRuns.find(run => run.id !== updated.id)?.id || '');
+                setSelectedIndex(null);
+            }
+        } catch (failure) {
+            setError(failure.message);
+            setRenameValue(null);
+        } finally {
+            setBusy(false);
+        }
+    }
+
     const row = detail?.sessionId === sessionId && detail?.row.index === index ? detail.row : null;
     const frameAge = session?.last_frame_received ? Math.max(0, Math.floor(now - session.last_frame_received)) : null;
     const videoMode = source === 'uploaded_video';
@@ -343,15 +414,15 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
         <section className="im-page" aria-label="Inferred Mission">
             <div className="im-run-bar">
                 <div className="im-actions im-run-selection">
-                    <label>Run <select value={sessionId} onChange={event => {
+                    <label>{showArchived ? 'Archived run' : 'Run'} <select value={sessionId} disabled={busy} onChange={event => {
                         const runId = event.target.value;
                         setSessionId(runId);
                         setSelectedIndex(null);
                         setNewRunOpen(!runId);
                     }}>
-                        <option value="">Select an analysis run</option>
-                        {runs.map(run => <option value={run.id} key={run.id}>
-                            {run.video ? `Video · ${run.video.name}` : `Live · ${run.vehicle_id}`} · {new Date(run.created_at * 1000).toLocaleString()}
+                        <option value="">{showArchived && !visibleRuns.length ? 'No archived runs' : 'Select an analysis run'}</option>
+                        {visibleRuns.map(run => <option value={run.id} key={run.id}>
+                            {runName(run)} · {new Date(run.created_at * 1000).toLocaleString()}
                         </option>)}
                     </select></label>
                     {session && <>
@@ -363,14 +434,29 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                     </>}
                 </div>
                 <div className="im-actions">
+                    {session && <button type="button" disabled={busy} onClick={() => setRenameValue(runName(session))}>Rename</button>}
+                    {session && (showArchived
+                        ? <button type="button" disabled={busy} onClick={() => updateRun({ archived: false })}>Restore</button>
+                        : <button type="button" disabled={busy || active} onClick={() => updateRun({ archived: true })}>Archive</button>)}
+                    <button type="button" disabled={busy} onClick={switchArchiveView}>{showArchived ? 'Analysis runs' : 'Archived runs'}</button>
                     {session?.status === 'analyzing' && <button type="button" disabled={busy} onClick={() => action('pause')}>Pause</button>}
-                    {session?.status === 'paused' && <button type="button" disabled={busy} onClick={() => action('resume')}>Resume</button>}
-                    {(active || session?.status === 'paused') && <button type="button" disabled={busy || session.status === 'stopping'} onClick={() => action('stop')}>Stop</button>}
+                    {!showArchived && session?.status === 'paused' && <button type="button" disabled={busy} onClick={() => action('resume')}>Resume</button>}
+                    {!showArchived && (active || session?.status === 'paused') && <button type="button" disabled={busy || session.status === 'stopping'} onClick={() => action('stop')}>Stop</button>}
                     <Button type="button" label="New run" icon={showNewRun ? 'pi pi-chevron-up' : 'pi pi-chevron-down'}
-                        size="small" outlined aria-expanded={showNewRun} aria-controls={newRunPanelId}
+                        size="small" outlined disabled={showArchived} aria-expanded={showNewRun} aria-controls={newRunPanelId}
                         onClick={() => setNewRunOpen(!showNewRun)} />
                 </div>
             </div>
+            <Dialog header="Rename analysis run" visible={renameValue !== null} modal closable={!busy} onHide={() => setRenameValue(null)}>
+                <form className="im-actions" onSubmit={event => {
+                    event.preventDefault();
+                    if (!busy && renameValue?.trim()) updateRun({ display_name: renameValue.trim() });
+                }}>
+                    <label>Display name <input autoFocus value={renameValue ?? ''} maxLength={120} required disabled={busy}
+                        onChange={event => setRenameValue(event.target.value)} /></label>
+                    <Button type="submit" label="Save" size="small" disabled={busy || !renameValue?.trim()} />
+                </form>
+            </Dialog>
             <div className="im-input" id={newRunPanelId} hidden={!showNewRun}>
                 <div className="im-run-settings">
                     <div className="im-source" aria-label="Footage source">
@@ -454,6 +540,11 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                     </p>
                 )}
                 {session.error && <p className="im-note">{session.error}</p>}
+                <TimingMetrics label="Run timing" metrics={[
+                    ['Run elapsed', runElapsed, 'Wall time from the start of analysis, including any pauses before completion'],
+                    ['Avg. vision inference', averageVision, `Average time to vision ready across ${visionReady.length} sections`],
+                    ['Avg. section to DSL ready', averageSection, `Based on ${completed.length} completed sections`],
+                ]} />
                 <div className="im-report">
                     <aside className="im-timeline" aria-label="Section timeline">
                         <div className="im-detail-title"><h3>Timeline</h3>
@@ -464,6 +555,10 @@ export default function InferredMissionPage({ vehicles, onApplyArtifact }) {
                             <span><strong>#{String(item.index).padStart(3, '0')}</strong> {timestamp(item.start - (session.video_takeoff_offset || 0))}–{timestamp(item.end - (session.video_takeoff_offset || 0))}</span>
                             {item.status !== 'completed' && <span className="im-muted">{label(item.status)}</span>}
                             <span className="im-section-nl">{item.inference_text || item.error || 'Preparing section'}</span>
+                            {(Number.isFinite(item.inference_elapsed) || item.status === 'completed') && <span className="im-section-timing">
+                                <span>Vision {durationLabel(item.inference_elapsed)}</span>
+                                {item.status === 'completed' && <span>DSL ready {durationLabel(item.elapsed)}</span>}
+                            </span>}
                         </button>)}
                         {!session.sections.length && <p className="im-muted">Waiting for the first section.</p>}
                     </aside>

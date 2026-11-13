@@ -2,6 +2,8 @@ import asyncio
 import json
 import subprocess
 import time
+from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 from fastapi import FastAPI
@@ -69,6 +71,8 @@ async def wait_for(client, run_id, predicate):
 @pytest.mark.skipif(not media_available(), reason="FFmpeg and ffprobe are required for MP4 tests")
 async def test_uploaded_video_pause_resume_and_download(tmp_path, monkeypatch):
     video = tmp_path / "flight.mp4"
+    upload_name = "private-caf\u00e9.mp4"
+    display_name = "360p Caf\u00e9 / Recency"
     subprocess.run([
         "ffmpeg", "-v", "error", "-n", "-f", "lavfi", "-i", "color=blue:s=96x64:r=8:d=2.25",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video),
@@ -79,7 +83,7 @@ async def test_uploaded_video_pause_resume_and_download(tmp_path, monkeypatch):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         bad = await client.post("/api/inferred-mission/videos", files={"file": ("broken.mp4", b"broken", "video/mp4")})
         assert bad.status_code == 422
-        uploaded = await client.post("/api/inferred-mission/videos", files={"file": ("private-filename.mp4", video.read_bytes(), "video/mp4")})
+        uploaded = await client.post("/api/inferred-mission/videos", files={"file": (upload_name, video.read_bytes(), "video/mp4")})
         assert uploaded.status_code == 201, uploaded.text
         asset = uploaded.json()
         assert asset["duration"] == 2.25
@@ -91,6 +95,7 @@ async def test_uploaded_video_pause_resume_and_download(tmp_path, monkeypatch):
         assert created.status_code == 201, created.text
         run_id = created.json()["id"]
         await wait_for(client, run_id, lambda r: r["sections"] and r["sections"][0]["status"] == "inferring")
+        assert (await client.patch(f"/api/inferred-mission/sessions/{run_id}", json={"archived": True})).status_code == 409
         paused = await client.post(f"/api/inferred-mission/sessions/{run_id}/pause")
         assert paused.json()["status"] == "pausing"
         gate.set()
@@ -103,23 +108,57 @@ async def test_uploaded_video_pause_resume_and_download(tmp_path, monkeypatch):
         assert resumed.status_code == 200, resumed.text
         complete = await wait_for(client, run_id, lambda r: r["status"] == "completed")
         assert [r["status"] for r in complete["sections"]] == ["completed"] * 3
+        assert complete["updated_at"] > complete["created_at"]
+        assert all(0 <= row["inference_elapsed"] <= row["elapsed"] for row in complete["sections"])
         assert complete["sections"][-1]["end"] == 2.25
         assert len(prompts) == 3
-        assert all("private-filename.mp4" not in prompt for prompt, _ in prompts)
+        assert all(upload_name not in prompt for prompt, _ in prompts)
         assert all(prompt.startswith(load_prompt().rstrip()) for prompt, _ in prompts)
         assert all(0 <= frame.time < 0.25 for frame in prompts[-1][1])
         path = f"/api/inferred-mission/sessions/{run_id}/sections/3"
         detail = (await client.get(path)).json()
+        assert 0 <= detail["frame_preparation_elapsed"] <= detail["inference_elapsed"]
+        assert 0 <= detail["vision_request_elapsed"] <= detail["inference_elapsed"]
+        assert detail["history_wait_elapsed"] >= 0
+        assert detail["elapsed"] == complete["sections"][-1]["elapsed"]
         assert [item["section"] for item in detail["history"]] == [1, 2]
         assert detail["history"][-1]["weight"] == 1
         assert [attempt["status"] for attempt in detail["attempts"]] == ["task_mismatch", "sdk_compiled"]
         assert detail["inference_text"] == INSTRUCTION
         assert (await client.get(f"{path}/files/mission.dsl")).text == detail["dsl"]
-        assert (await client.get(f"{path}/files/mission.json")).json() == detail["mission_json"]
+        download = await client.get(f"{path}/files/mission.json")
+        assert download.json() == detail["mission_json"]
+        assert unquote(download.headers["content-disposition"].split("filename*=UTF-8''", 1)[1]).startswith(f"{Path(upload_name).stem}_")
         assert (await client.get(f"{path}/frames/0")).headers["content-type"] == "image/jpeg"
         arm = await client.post(f"/api/inferred-mission/sessions/{run_id}/backup/arm")
         assert arm.status_code == 404
+        endpoint = f"/api/inferred-mission/sessions/{run_id}"
+        renamed = await client.patch(endpoint, json={"display_name": f"  {display_name}  "})
+        assert renamed.status_code == 200
+        assert renamed.json()["display_name"] == display_name
+        assert renamed.json()["updated_at"] == complete["updated_at"]
+        assert (await client.patch(endpoint, json={"display_name": "   "})).status_code == 422
+        for filename in ("mission.json", "inference.json"):
+            result = await client.get(f"{path}/files/{filename}")
+            disposition = result.headers["content-disposition"]
+            downloaded_name = unquote(disposition.split("filename*=UTF-8''", 1)[1])
+            assert downloaded_name.startswith("360p-Caf\u00e9-Recency_")
+            assert downloaded_name.endswith(f"Z_section-000003_{filename}")
+
+        archived = await client.patch(endpoint, json={"archived": True})
+        assert archived.status_code == 200 and archived.json()["archived_at"] is not None
+        assert (await client.get("/api/inferred-mission/sessions")).json() == []
+        assert (await client.get(f"{path}/files/mission.json")).status_code == 200
+        assert (await client.get(f"/api/inferred-mission/videos/{asset['id']}/media")).status_code == 200
         await recovered.close()
+        reopened = AnalysisService(service.root)
+        reopened.recover()
+        app.state.inferred_mission = reopened
+        assert (await client.get("/api/inferred-mission/sessions")).json() == []
+        archived_list = (await client.get("/api/inferred-mission/sessions?include_archived=true")).json()
+        assert archived_list[0]["display_name"] == display_name
+        assert (await client.patch(endpoint, json={"archived": False})).json()["archived_at"] is None
+        assert (await client.get("/api/inferred-mission/sessions")).json()[0]["id"] == run_id
 
 
 @pytest.mark.asyncio

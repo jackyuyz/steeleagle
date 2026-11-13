@@ -85,6 +85,20 @@
 .im-run-bar { padding: 0.65rem 0.85rem; }
 .im-run-selection, .im-run-selection > label { min-width: 0; max-width: 100%; }
 .im-run-bar select { width: min(26rem, 100%); }
+.im-timing {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem 1.5rem;
+    margin: 0.75rem 0;
+    padding: 0.65rem 0.85rem;
+    border: 1px solid var(--im-line);
+    border-radius: 0.5rem;
+    background: var(--im-panel);
+}
+.im-timing dt, .im-section-timing { color: var(--im-muted); font-size: 0.8rem; }
+.im-timing dd { margin: 0.2rem 0 0; font-weight: 600; }
+.im-timing dd, .im-section-timing { font-variant-numeric: tabular-nums; }
+.im-section-timing { display: flex; flex-wrap: wrap; gap: 0.15rem 0.75rem; }
 .im-report {
     display: grid;
     grid-template-columns: minmax(13rem, 21%) minmax(0, 1fr);
